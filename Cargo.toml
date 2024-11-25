@@ -1,0 +1,11 @@
+[package]
+name = "pilight"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+rppal = "0.19"
+pnet = "0.35"
+ndarray = "0.16"
+
+
