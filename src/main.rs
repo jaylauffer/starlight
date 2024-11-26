@@ -41,7 +41,7 @@ impl PacketCompressor {
     /// Generate weights with a sinusoidal pattern
     fn generate_waveform_weights(rows: usize, cols: usize) -> Array2<f32> {
         Array2::from_shape_fn((rows, cols), |(i, j)| {
-            (i as f32 / rows as f32 * 2.0 * PI).sin() * (j as f32 / cols as f32 * 2.0 * PI).cos()
+           0.11389 + (i as f32 / rows as f32 * 2.0 * PI).sin() * (j as f32 / cols as f32 * 2.0 * PI).cos()
         })
     }
 
@@ -106,15 +106,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
   //  fb.seek(SeekFrom::Start(0))?;
 
     // Fill buffer with colors (red, green, blue)
-    for i in 0..64 {
-        buffer[i * 2] = 0x0F; // Red
-        buffer[i * 2 + 1] = 0; // Green
+    for i in 0..8 {
+        buffer[i * 2] = 0; // Red
+        buffer[i * 2 + 1] = 0x0F; // Green
     //    buffer[i * 3 + 2] = 0; // Blue
     }
 
     fb.write_all(&buffer)?;
     fb.seek(SeekFrom::Start(0))?;
-    thread::sleep(Duration::from_secs(5));
+    thread::sleep(Duration::from_secs(3));
 
     let clear = [0, 0].repeat(64); // All LEDs red
    
@@ -127,7 +127,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     fb.seek(SeekFrom::Start(0))?;
 
     // Keep the LEDs lit for 5 seconds
-    thread::sleep(Duration::from_secs(5));
+    thread::sleep(Duration::from_secs(3));
 
     // Turn off the LEDs by sending a buffer of zeros
     fb.write_all(&[0; 128])?;
@@ -182,7 +182,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 // for (i, byte) in packet.iter().enumerate().take(192) {
                 //     buffer[i] = *byte; // Truncate or pad as needed
                 // }
-
+                //println!("compressed length: {}", compressed.len());
                     // Convert the 48 floats to a byte array
                 let buffer: &[u8] = unsafe {
                     std::slice::from_raw_parts(
@@ -190,6 +190,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         compressed.len() * std::mem::size_of::<f32>(),
                     )
                 };
+                //println!("buffer length: {}", buffer.len());
                 fb.write_all(&buffer)?;
                 fb.seek(SeekFrom::Start(0))?;
                 //thread::sleep(Duration::from_millis(20));
