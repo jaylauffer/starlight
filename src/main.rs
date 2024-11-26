@@ -1,4 +1,5 @@
-use rppal::i2c::I2c;
+use std::fs::OpenOptions;
+use std::io::{Seek, SeekFrom, Write};
 use std::thread;
 use std::time::Duration;
 use pnet::datalink::{self, Channel, Config, NetworkInterface};
@@ -14,6 +15,8 @@ struct PacketCompressor {
     biases2: Array1<f32>,
     weights3: Array2<f32>,
     biases3: Array1<f32>,
+    weights4: Array2<f32>,
+    biases4: Array1<f32>,
 }
 
 impl PacketCompressor {
@@ -21,14 +24,17 @@ impl PacketCompressor {
     fn new(input_size: usize, compressed_size: usize) -> Self {
         let layer1_size = 1024;
         let layer2_size = 512;
+        let layer3_size = 256;
 
         PacketCompressor {
             weights1: Self::generate_waveform_weights(input_size, layer1_size),
             biases1: Self::generate_waveform_biases(layer1_size),
-            weights2: Self::generate_waveform_weights(layer1_size, layer2_size),
+            weights2: Self::generate_parabolic_weights(layer1_size, layer2_size),
             biases2: Self::generate_waveform_biases(layer2_size),
-            weights3: Self::generate_parabolic_weights(layer2_size, compressed_size),
-            biases3: Self::generate_waveform_biases(compressed_size),
+            weights3: Self::generate_waveform_weights(layer2_size, layer3_size),
+            biases3: Self::generate_waveform_biases(layer3_size),
+            weights4: Self::generate_parabolic_weights(layer3_size, compressed_size),
+            biases4: Self::generate_waveform_biases(compressed_size),
         }
     }
 
@@ -63,8 +69,11 @@ impl PacketCompressor {
         let mut hidden2 = hidden1.dot(&self.weights2) + &self.biases2;
         hidden2.mapv_inplace(|x| x.max(0.0)); // ReLU activation
 
+        let mut hidden3 = hidden2.dot(&self.weights3) + &self.biases3;
+        hidden3.mapv_inplace(|x| x.max(0.0));
+
         // Layer 3: hidden2 -> Wx + b
-        hidden2.dot(&self.weights3) + &self.biases3
+        hidden3.dot(&self.weights4) + &self.biases4
     }
 }
 
@@ -87,44 +96,42 @@ fn bytes_to_f32_vector(bytes: &[u8]) -> Array1<f32> {
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // Initialize I2C interface
-    let mut i2c = I2c::new()?;
-    
-    // Set the address for the Sense HAT LED matrix
-    i2c.set_slave_address(0x46)?;
+    let mut fb = OpenOptions::new()
+        .write(true)
+        .open("/dev/fb1")?; // Adjust if your framebuffer is not fb1
 
     // // Define a simple RGB pattern for the 8x8 LED matrix
-    // let mut buffer = [0u8; 192]; // 8x8 RGB matrix (8 rows x 8 columns x 3 bytes per LED)
+    let mut buffer = [0u8; 128]; // 8x8 RGB matrix (8 rows x 8 columns x 3 bytes per LED)
+ //   fb.write_all(&buffer)?;
+  //  fb.seek(SeekFrom::Start(0))?;
 
-    // // Fill buffer with colors (red, green, blue)
-    // for i in 0..64 {
-    //     buffer[i * 3] = 255; // Red
-    //     buffer[i * 3 + 1] = 0; // Green
-    //     buffer[i * 3 + 2] = 0; // Blue
-    // }
+    // Fill buffer with colors (red, green, blue)
+    for i in 0..64 {
+        buffer[i * 2] = 0x0F; // Red
+        buffer[i * 2 + 1] = 0; // Green
+    //    buffer[i * 3 + 2] = 0; // Blue
+    }
 
-    let clear = [0, 0, 0].repeat(64); // All LEDs red
+    fb.write_all(&buffer)?;
+    fb.seek(SeekFrom::Start(0))?;
+    thread::sleep(Duration::from_secs(5));
+
+    let clear = [0, 0].repeat(64); // All LEDs red
+   
+    fb.write_all(&clear)?;
+    fb.seek(SeekFrom::Start(0))?;
+
+    let buffer = [255, 0].repeat(64); // All LEDs red
     // Send buffer to Sense HAT
-    i2c.block_write(0x00, &clear)?;
-
-     let single = [255, 255, 0, 255, 0, 0, 255, 255, 
-                    0, 255, 0, 255, 255, 255, 0, 255, 
-                    0, 0, 255, 255, 0, 255, 0, 255];
-     i2c.block_write(0x00, &single)?;
-     thread::sleep(Duration::from_secs(8));
-
-    //i2c.smbus_write_word(0x02, 0xFFFF);
-    //thread::sleep(Duration::from_secs(5));
-
-    let buffer = [255, 0, 0].repeat(64); // All LEDs red
-    // Send buffer to Sense HAT
-    i2c.block_write(0x00, &buffer)?;
+    fb.write_all(&buffer)?;
+    fb.seek(SeekFrom::Start(0))?;
 
     // Keep the LEDs lit for 5 seconds
     thread::sleep(Duration::from_secs(5));
 
     // Turn off the LEDs by sending a buffer of zeros
-    i2c.block_write(0x00, &[0; 192])?;
+    fb.write_all(&[0; 128])?;
+    fb.seek(SeekFrom::Start(0))?;
 
     // Get the interface to capture packets from
     let interface_name = env::args().nth(1).expect("Usage: cargo run <interface_name>");
@@ -151,7 +158,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Input packet size and compressed output size
     let input_size = 1518; // Max Ethernet packet size
-    let compressed_size = 48; // Compressed size for Sense HAT
+    let compressed_size = 32; // Compressed size for Sense HAT
 
     // Create the compressor network
     let compressor = PacketCompressor::new(input_size, compressed_size);
@@ -183,12 +190,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         compressed.len() * std::mem::size_of::<f32>(),
                     )
                 };
-                let mut p : u8 = 0;
-                // Send buffer to the Sense HAT
-                for chunk in buffer.chunks(32) {
-                    i2c.block_write(p * 6, &chunk)?;
-                    p += 1;
-                }
+                fb.write_all(&buffer)?;
+                fb.seek(SeekFrom::Start(0))?;
                 //thread::sleep(Duration::from_millis(20));
             }
             Err(e) => {
