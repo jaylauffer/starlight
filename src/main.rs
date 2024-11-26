@@ -4,7 +4,7 @@ use std::time::Duration;
 use pnet::datalink::{self, Channel, Config, NetworkInterface};
 use pnet::packet::{ethernet::EthernetPacket, Packet};
 use std::env;
-use ndarray::{Array1, Array2};
+use ndarray::{Array, Array1, Array2, s};
 use std::f32::consts::PI;
 
 struct PacketCompressor {
@@ -68,8 +68,22 @@ impl PacketCompressor {
     }
 }
 
-fn bytes_to_f32_vector(bytes: &[u8]) -> Vec<f32> {
-    bytes.iter().map(|&byte| byte as f32 / 255.0).collect()
+/// Convert &[u8] to an Array1<f32> and pad with zeros to 1518 elements
+fn bytes_to_f32_vector(bytes: &[u8]) -> Array1<f32> {
+    const REQUIRED_SIZE: usize = 1518;
+
+    // Convert bytes to f32 in the range [0.0, 1.0]
+    let floats: Vec<f32> = bytes.iter().map(|&byte| byte as f32 / 255.0).collect();
+
+    if floats.len() >= REQUIRED_SIZE {
+        // If the length is greater than or equal to REQUIRED_SIZE, truncate it
+        Array1::from(floats[..REQUIRED_SIZE].to_vec())
+    } else {
+        // If the length is less than REQUIRED_SIZE, pad with zeros
+        let mut padded = Array::zeros(REQUIRED_SIZE);
+        padded.slice_mut(s![..floats.len()]).assign(&Array1::from(floats));
+        padded
+    }
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -79,16 +93,30 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Set the address for the Sense HAT LED matrix
     i2c.set_slave_address(0x46)?;
 
-    // Define a simple RGB pattern for the 8x8 LED matrix
-    let mut buffer = [0u8; 192]; // 8x8 RGB matrix (8 rows x 8 columns x 3 bytes per LED)
+    // // Define a simple RGB pattern for the 8x8 LED matrix
+    // let mut buffer = [0u8; 192]; // 8x8 RGB matrix (8 rows x 8 columns x 3 bytes per LED)
 
-    // Fill buffer with colors (red, green, blue)
-    for i in 0..64 {
-        buffer[i * 3] = 255; // Red
-        buffer[i * 3 + 1] = 0; // Green
-        buffer[i * 3 + 2] = 0; // Blue
-    }
+    // // Fill buffer with colors (red, green, blue)
+    // for i in 0..64 {
+    //     buffer[i * 3] = 255; // Red
+    //     buffer[i * 3 + 1] = 0; // Green
+    //     buffer[i * 3 + 2] = 0; // Blue
+    // }
 
+    let clear = [0, 0, 0].repeat(64); // All LEDs red
+    // Send buffer to Sense HAT
+    i2c.block_write(0x00, &clear)?;
+
+     let single = [255, 255, 0, 255, 0, 0, 255, 255, 
+                    0, 255, 0, 255, 255, 255, 0, 255, 
+                    0, 0, 255, 255, 0, 255, 0, 255];
+     i2c.block_write(0x00, &single)?;
+     thread::sleep(Duration::from_secs(8));
+
+    //i2c.smbus_write_word(0x02, 0xFFFF);
+    //thread::sleep(Duration::from_secs(5));
+
+    let buffer = [255, 0, 0].repeat(64); // All LEDs red
     // Send buffer to Sense HAT
     i2c.block_write(0x00, &buffer)?;
 
@@ -155,8 +183,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         compressed.len() * std::mem::size_of::<f32>(),
                     )
                 };
+                let mut p : u8 = 0;
                 // Send buffer to the Sense HAT
-                i2c.block_write(0x00, &buffer)?;
+                for chunk in buffer.chunks(32) {
+                    i2c.block_write(p * 6, &chunk)?;
+                    p += 1;
+                }
+                //thread::sleep(Duration::from_millis(20));
             }
             Err(e) => {
                 eprintln!("Failed to read packet: {}", e);
