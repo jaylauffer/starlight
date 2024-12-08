@@ -2,8 +2,7 @@ use std::fs::OpenOptions;
 use std::io::{Seek, SeekFrom, Write};
 use std::thread;
 use std::time::Duration;
-use pnet::datalink::{self, Channel, Config, NetworkInterface};
-use pnet::packet::{ethernet::EthernetPacket, Packet};
+use pnet::datalink::{self, Channel, Config};
 use std::env;
 use ndarray::{Array, Array1, Array2, s};
 use std::f32::consts::PI;
@@ -72,7 +71,7 @@ impl PacketCompressor {
         let mut hidden3 = hidden2.dot(&self.weights3) + &self.biases3;
         hidden3.mapv_inplace(|x| x.max(0.0));
 
-        // Layer 3: hidden2 -> Wx + b
+        // Layer 4: hidden3 -> Wx + b
         hidden3.dot(&self.weights4) + &self.biases4
     }
 }
@@ -102,14 +101,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // // Define a simple RGB pattern for the 8x8 LED matrix
     let mut buffer = [0u8; 128]; // 8x8 RGB matrix (8 rows x 8 columns x 3 bytes per LED)
- //   fb.write_all(&buffer)?;
-  //  fb.seek(SeekFrom::Start(0))?;
 
     // Fill buffer with colors (red, green, blue)
     for i in 0..8 {
         buffer[i * 2] = 0; // Red
         buffer[i * 2 + 1] = 0x0F; // Green
-    //    buffer[i * 3 + 2] = 0; // Blue
     }
 
     fb.write_all(&buffer)?;
@@ -168,32 +164,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         match channel.next() {
             Ok(packet) => {
                 let compressed = compressor.compress(bytes_to_f32_vector(packet));
-                //let ethernet_packet = EthernetPacket::new(packet).unwrap();
-//                println!(
-//                    "Captured packet: {} -> {} (type: {:?}, length: {})",
-//                    ethernet_packet.get_source(),
-//                    ethernet_packet.get_destination(),
-//                    ethernet_packet.get_ethertype(),
-//                    ethernet_packet.packet().len()
-//                );
-//                let mut buffer = [0u8; 192];
 
-                // // Map raw bytes directly to the LED matrix buffer
-                // for (i, byte) in packet.iter().enumerate().take(192) {
-                //     buffer[i] = *byte; // Truncate or pad as needed
-                // }
-                //println!("compressed length: {}", compressed.len());
-                    // Convert the 48 floats to a byte array
                 let buffer: &[u8] = unsafe {
                     std::slice::from_raw_parts(
                         compressed.as_ptr() as *const u8,
                         compressed.len() * std::mem::size_of::<f32>(),
                     )
                 };
-                //println!("buffer length: {}", buffer.len());
                 fb.write_all(&buffer)?;
                 fb.seek(SeekFrom::Start(0))?;
-                //thread::sleep(Duration::from_millis(20));
             }
             Err(e) => {
                 eprintln!("Failed to read packet: {}", e);

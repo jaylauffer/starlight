@@ -7,5 +7,5 @@ edition = "2021"
 rppal = "0.19"
 pnet = "0.35"
 ndarray = "0.16"
-
+cpal = "0.15"
 
