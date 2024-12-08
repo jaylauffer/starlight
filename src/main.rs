@@ -7,6 +7,9 @@ use std::env;
 use ndarray::{Array, Array1, Array2, s};
 use std::f32::consts::PI;
 
+use cpal::traits::HostTrait;
+use cpal::traits::DeviceTrait;
+
 struct PacketCompressor {
     weights1: Array2<f32>,
     biases1: Array1<f32>,
@@ -95,6 +98,38 @@ fn bytes_to_f32_vector(bytes: &[u8]) -> Array1<f32> {
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let host = cpal::default_host();
+
+    match host.devices() {
+        Ok(devices) => {
+            println!("Available audio devices:");
+            for (index, device) in devices.enumerate() {
+                match device.name() {
+                    Ok(name) => println!("{}. {}", index + 1, name),
+                    Err(err) => println!("{}. <Unknown Device> (Error: {:?})", index + 1, err),
+                }
+            }
+        }
+        Err(err) => {
+            eprintln!("Failed to get devices: {:?}", err);
+        }
+    }
+
+    match host.input_devices() {
+        Ok(devices) => {
+            println!("Input-capable audio devices:");
+            for (index, device) in devices.enumerate() {
+                match device.name() {
+                    Ok(name) => println!("{}. {}", index + 1, name),
+                    Err(err) => println!("{}. <Unknown Device> (Error: {:?})", index + 1, err),
+                }
+            }
+        }
+        Err(err) => {
+            eprintln!("Failed to get input devices: {:?}", err);
+        }
+    }
+
     let mut fb = OpenOptions::new()
         .write(true)
         .open("/dev/fb1")?; // Adjust if your framebuffer is not fb1
