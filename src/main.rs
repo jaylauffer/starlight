@@ -98,7 +98,7 @@ fn bytes_to_f32_vector(bytes: &[u8]) -> Array1<f32> {
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let host = cpal::default_host();
+/*     let host = cpal::default_host();
 
     match host.devices() {
         Ok(devices) => {
@@ -128,11 +128,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         Err(err) => {
             eprintln!("Failed to get input devices: {:?}", err);
         }
-    }
+    } */
 
     let mut fb = OpenOptions::new()
         .write(true)
-        .open("/dev/fb1")?; // Adjust if your framebuffer is not fb1
+        .open("/dev/fb0")?; // Adjust if your framebuffer is not fb1
 
     // // Define a simple RGB pattern for the 8x8 LED matrix
     let mut buffer = [0u8; 128]; // 8x8 RGB matrix (8 rows x 8 columns x 3 bytes per LED)
