@@ -7,8 +7,8 @@ use std::env;
 use ndarray::{Array, Array1, Array2, s};
 use std::f32::consts::PI;
 
-use cpal::traits::HostTrait;
-use cpal::traits::DeviceTrait;
+//use cpal::traits::HostTrait;
+//use cpal::traits::DeviceTrait;
 
 struct PacketCompressor {
     weights1: Array2<f32>,
@@ -132,7 +132,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let mut fb = OpenOptions::new()
         .write(true)
-        .open("/dev/fb0")?; // Adjust if your framebuffer is not fb1
+        .open("/dev/fb1")?; // Adjust if your framebuffer is not fb1
 
     // // Define a simple RGB pattern for the 8x8 LED matrix
     let mut buffer = [0u8; 128]; // 8x8 RGB matrix (8 rows x 8 columns x 3 bytes per LED)
