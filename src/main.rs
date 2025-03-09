@@ -129,10 +129,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             eprintln!("Failed to get input devices: {:?}", err);
         }
     } */
+    let fbuffer = env::args().nth(2).expect("Usage: cargo run <interface_name> <framebuffer_name>");
 
     let mut fb = OpenOptions::new()
         .write(true)
-        .open("/dev/fb1")?; // Adjust if your framebuffer is not fb1
+        .open(fbuffer)?; // Adjust if your framebuffer is not fb1
 
     // // Define a simple RGB pattern for the 8x8 LED matrix
     let mut buffer = [0u8; 128]; // 8x8 RGB matrix (8 rows x 8 columns x 3 bytes per LED)
