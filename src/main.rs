@@ -1,11 +1,17 @@
-use std::fs::OpenOptions;
-use std::io::{Seek, SeekFrom, Write};
-use std::thread;
-use std::time::Duration;
-use pnet::datalink::{self, Channel, Config};
 use std::env;
+use std::fs::{read_to_string, OpenOptions};
+use std::io::{self, Seek, SeekFrom, Write};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+use std::sync::Arc;
+use std::thread;
+use std::time::{Duration, Instant};
+use pnet::datalink::{self, Channel, Config};
 use ndarray::{Array, Array1, Array2, s};
 use std::f32::consts::PI;
+
+const THERMAL_STATE_NORMAL: u8 = 0;
+const THERMAL_STATE_WARNING: u8 = 1;
+const THERMAL_STATE_CRITICAL: u8 = 2;
 
 //use cpal::traits::HostTrait;
 //use cpal::traits::DeviceTrait;
@@ -97,6 +103,39 @@ fn bytes_to_f32_vector(bytes: &[u8]) -> Array1<f32> {
     }
 }
 
+fn parse_temp_env(var_name: &str, default: f32) -> f32 {
+    env::var(var_name)
+        .ok()
+        .and_then(|value| value.parse::<f32>().ok())
+        .filter(|value| *value > 0.0 && value.is_finite())
+        .unwrap_or(default)
+}
+
+fn parse_temp_interval_env(var_name: &str, default: u64) -> u64 {
+    env::var(var_name)
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(default)
+}
+
+fn read_cpu_temperature_c() -> Option<f32> {
+    const TEMP_PATHS: [&str; 2] = [
+        "/sys/class/thermal/thermal_zone0/temp",
+        "/sys/class/thermal/thermal_zone1/temp",
+    ];
+
+    for path in TEMP_PATHS {
+        if let Ok(raw) = read_to_string(path) {
+            if let Ok(parsed) = raw.trim().parse::<f32>() {
+                return Some(if parsed > 200.0 { parsed / 1000.0 } else { parsed });
+            }
+        }
+    }
+
+    None
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
 /*     let host = cpal::default_host();
 
@@ -129,7 +168,91 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             eprintln!("Failed to get input devices: {:?}", err);
         }
     } */
-    let fbuffer = env::args().nth(2).expect("Usage: cargo run <interface_name> <framebuffer_name>");
+    let mut args = env::args().skip(1);
+    let interface_name = args
+        .next()
+        .expect("Usage: cargo run <interface_name> <framebuffer_name>");
+    let fbuffer = args
+        .next()
+        .expect("Usage: cargo run <interface_name> <framebuffer_name>");
+
+    let warn_temp_c = parse_temp_env("STARLIGHT_WARN_TEMP_C", 80.0);
+    let critical_temp_c = parse_temp_env("STARLIGHT_CRIT_TEMP_C", 85.0);
+    let temp_check_interval = Duration::from_secs(parse_temp_interval_env(
+        "STARLIGHT_TEMP_CHECK_INTERVAL_SECS",
+        5,
+    ));
+
+    if critical_temp_c <= warn_temp_c {
+        return Err(format!(
+            "Environment config invalid: STARLIGHT_CRIT_TEMP_C ({critical_temp_c:.1}) must be higher than STARLIGHT_WARN_TEMP_C ({warn_temp_c:.1})"
+        )
+        .into());
+    }
+
+    if let Some(start_temp) = read_cpu_temperature_c() {
+        println!(
+            "Starting Starlight. Current CPU temperature: {:.1}°C",
+            start_temp
+        );
+    }
+
+    println!(
+        "CPU monitor enabled: warning at {:.1}°C, shutdown at {:.1}°C (interval: {:?})",
+        warn_temp_c,
+        critical_temp_c,
+        temp_check_interval
+    );
+
+    let running = Arc::new(AtomicBool::new(true));
+    let thermal_state_arc = Arc::new(AtomicU8::new(THERMAL_STATE_NORMAL));
+    let monitor_running = running.clone();
+    let monitor_state = thermal_state_arc.clone();
+    let monitor = thread::spawn(move || {
+        let mut warned = false;
+        let mut last_status = Instant::now();
+
+    while monitor_running.load(Ordering::Acquire) {
+        if let Some(temperature_c) = read_cpu_temperature_c() {
+            if temperature_c >= critical_temp_c {
+                monitor_state.store(THERMAL_STATE_CRITICAL, Ordering::Release);
+                eprintln!(
+                    "CRITICAL: CPU temperature {:.1}°C >= {:.1}°C, stopping capture",
+                    temperature_c,
+                    critical_temp_c
+                );
+                monitor_running.store(false, Ordering::Release);
+                break;
+            }
+
+            if temperature_c >= warn_temp_c {
+                monitor_state.store(THERMAL_STATE_WARNING, Ordering::Release);
+                if !warned {
+                    eprintln!(
+                        "WARNING: CPU temperature {:.1}°C >= {:.1}°C",
+                        temperature_c,
+                        warn_temp_c
+                    );
+                    warned = true;
+                }
+            } else if warned {
+                monitor_state.store(THERMAL_STATE_NORMAL, Ordering::Release);
+                println!("CPU temperature recovered to {:.1}°C", temperature_c);
+                warned = false;
+            }
+
+                if last_status.elapsed() >= Duration::from_secs(30) {
+                    println!("CPU temperature: {:.1}°C", temperature_c);
+                    last_status = Instant::now();
+                }
+        } else {
+            eprintln!("Unable to read CPU temperature from /sys/class/thermal/*/temp");
+        }
+
+        thread::sleep(temp_check_interval);
+    }
+
+    });
 
     let mut fb = OpenOptions::new()
         .write(true)
@@ -165,9 +288,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     fb.write_all(&[0; 128])?;
     fb.seek(SeekFrom::Start(0))?;
 
-    // Get the interface to capture packets from
-    let interface_name = env::args().nth(1).expect("Usage: cargo run <interface_name>");
-
     // Find the network interface by name
     let interfaces = datalink::interfaces();
     let interface = interfaces
@@ -178,10 +298,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Configure the interface for promiscuous mode
     let mut config = Config::default();
     config.promiscuous = true;
+    config.read_timeout = Some(temp_check_interval);
 
     // Create a datalink channel to capture packets
     let mut channel = match datalink::channel(&interface, config) {
-        Ok(Channel::Ethernet(_rx, tx)) => tx,
+        Ok(Channel::Ethernet(_tx, rx)) => rx,
         Ok(_) => panic!("Unhandled channel type"),
         Err(e) => panic!("Failed to create datalink channel: {}", e),
     };
@@ -194,28 +315,100 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Create the compressor network
     let compressor = PacketCompressor::new(input_size, compressed_size);
+    let mut warning_pulse = false;
+    let mut last_warning_pulse_toggle = Instant::now();
+    let warning_pulse_rate = Duration::from_millis(350);
+    let yellow_frame: [u8; 128] = {
+        let mut frame = [0u8; 128];
+        for i in (0..64).step_by(1) {
+            frame[i * 2] = 0xFF;
+            frame[i * 2 + 1] = 0xF0;
+        }
+        frame
+    };
+    let red_frame: [u8; 128] = {
+        let mut frame = [0u8; 128];
+        for i in (0..64).step_by(1) {
+            frame[i * 2] = 0xFF;
+        }
+        frame
+    };
+    let clear_frame = [0u8; 128];
 
     // Capture and process packets
     loop {
-        match channel.next() {
-            Ok(packet) => {
-                let compressed = compressor.compress(bytes_to_f32_vector(packet));
+        let current_thermal_state = thermal_state_arc.load(Ordering::Acquire);
+        if !running.load(Ordering::Acquire) {
+            if current_thermal_state == THERMAL_STATE_CRITICAL {
+                if last_warning_pulse_toggle.elapsed() >= warning_pulse_rate {
+                    warning_pulse = !warning_pulse;
+                }
 
-                let buffer: &[u8] = unsafe {
-                    std::slice::from_raw_parts(
-                        compressed.as_ptr() as *const u8,
-                        compressed.len() * std::mem::size_of::<f32>(),
-                    )
+                let frame = if warning_pulse {
+                    &red_frame
+                } else {
+                    &clear_frame
                 };
-                fb.write_all(&buffer)?;
+                fb.write_all(frame)?;
                 fb.seek(SeekFrom::Start(0))?;
             }
+            break;
+        }
+
+        let current_thermal_state = thermal_state_arc.load(Ordering::Acquire);
+        let mut packet_data: Option<Array1<f32>> = None;
+
+        match channel.next() {
+            Ok(packet) => {
+                if current_thermal_state == THERMAL_STATE_NORMAL {
+                    let compressed = compressor.compress(bytes_to_f32_vector(packet));
+                    packet_data = Some(compressed);
+                }
+            }
             Err(e) => {
-                eprintln!("Failed to read packet: {}", e);
+                if e.kind() != io::ErrorKind::WouldBlock && e.kind() != io::ErrorKind::TimedOut {
+                    eprintln!("Failed to read packet: {}", e);
+                }
             }
         }
+
+        let current_thermal_state = thermal_state_arc.load(Ordering::Acquire);
+        if current_thermal_state != THERMAL_STATE_NORMAL {
+            if last_warning_pulse_toggle.elapsed() >= warning_pulse_rate {
+                warning_pulse = !warning_pulse;
+                last_warning_pulse_toggle = Instant::now();
+            }
+
+            let frame = if warning_pulse {
+                match current_thermal_state {
+                    THERMAL_STATE_WARNING => &yellow_frame,
+                    THERMAL_STATE_CRITICAL => &red_frame,
+                    _ => &clear_frame,
+                }
+            } else {
+                &clear_frame
+            };
+            fb.write_all(frame)?;
+            fb.seek(SeekFrom::Start(0))?;
+            continue;
+        }
+
+        if let Some(compressed) = packet_data {
+            let buffer: &[u8] = unsafe {
+                std::slice::from_raw_parts(
+                    compressed.as_ptr() as *const u8,
+                    compressed.len() * std::mem::size_of::<f32>(),
+                )
+            };
+            fb.write_all(&buffer)?;
+            fb.seek(SeekFrom::Start(0))?;
+        }
+    }
+
+    running.store(false, Ordering::Release);
+    if let Err(err) = monitor.join() {
+        eprintln!("Temperature monitor thread failed: {:?}", err);
     }
 
     Ok(())
 }
-
