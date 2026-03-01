@@ -302,7 +302,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Create a datalink channel to capture packets
     let mut channel = match datalink::channel(&interface, config) {
-        Ok(Channel::Ethernet(_rx, tx)) => tx,
+        Ok(Channel::Ethernet(_tx, rx)) => rx,
         Ok(_) => panic!("Unhandled channel type"),
         Err(e) => panic!("Failed to create datalink channel: {}", e),
     };
@@ -366,7 +366,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
             Err(e) => {
-                if e.kind() != io::ErrorKind::WouldBlock {
+                if e.kind() != io::ErrorKind::WouldBlock && e.kind() != io::ErrorKind::TimedOut {
                     eprintln!("Failed to read packet: {}", e);
                 }
             }
