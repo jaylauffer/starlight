@@ -1,10 +1,12 @@
 use std::env;
 use std::fs::{read_to_string, OpenOptions};
 use std::io::{self, Seek, SeekFrom, Write};
+use std::os::unix::net::UnixDatagram;
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
+use std::time::{SystemTime, UNIX_EPOCH};
 use pnet::datalink::{self, Channel, Config};
 use ndarray::{Array, Array1, Array2, s};
 use std::f32::consts::PI;
@@ -136,6 +138,59 @@ fn read_cpu_temperature_c() -> Option<f32> {
     None
 }
 
+fn thermal_state_name(state: u8) -> &'static str {
+    match state {
+        THERMAL_STATE_WARNING => "warning",
+        THERMAL_STATE_CRITICAL => "critical",
+        _ => "normal",
+    }
+}
+
+fn thermal_recommendation(state: u8) -> &'static str {
+    match state {
+        THERMAL_STATE_WARNING => "throttle",
+        THERMAL_STATE_CRITICAL => "pause",
+        _ => "normal",
+    }
+}
+
+fn unix_timestamp_seconds() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+
+fn emit_thermal_signal(
+    socket: &UnixDatagram,
+    socket_path: &str,
+    state: u8,
+    temperature_c: Option<f32>,
+    warn_temp_c: f32,
+    critical_temp_c: f32,
+) {
+    let temp_json = match temperature_c {
+        Some(temp) => format!("{temp:.1}"),
+        None => "null".to_string(),
+    };
+    let payload = format!(
+        "{{\"state\":\"{}\",\"temp_c\":{},\"warn_c\":{:.1},\"crit_c\":{:.1},\"ts\":{},\"recommendation\":\"{}\"}}",
+        thermal_state_name(state),
+        temp_json,
+        warn_temp_c,
+        critical_temp_c,
+        unix_timestamp_seconds(),
+        thermal_recommendation(state),
+    );
+
+    if let Err(err) = socket.send_to(payload.as_bytes(), socket_path) {
+        eprintln!(
+            "Unable to publish thermal signal to {}: {}",
+            socket_path, err
+        );
+    }
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
 /*     let host = cpal::default_host();
 
@@ -182,6 +237,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         "STARLIGHT_TEMP_CHECK_INTERVAL_SECS",
         5,
     ));
+    let signal_socket_path = env::var("STARLIGHT_SIGNAL_SOCKET")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty());
+    let signal_socket = if signal_socket_path.is_some() {
+        match UnixDatagram::unbound() {
+            Ok(socket) => Some(socket),
+            Err(err) => {
+                eprintln!("Unable to initialize signal socket publisher: {}", err);
+                None
+            }
+        }
+    } else {
+        None
+    };
 
     if critical_temp_c <= warn_temp_c {
         return Err(format!(
@@ -203,17 +273,28 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         critical_temp_c,
         temp_check_interval
     );
+    if let Some(path) = signal_socket_path.as_deref() {
+        println!("Thermal signal publisher enabled: {}", path);
+    }
 
     let running = Arc::new(AtomicBool::new(true));
     let thermal_state_arc = Arc::new(AtomicU8::new(THERMAL_STATE_NORMAL));
     let monitor_running = running.clone();
     let monitor_state = thermal_state_arc.clone();
+    let monitor_signal_socket = signal_socket;
+    let monitor_signal_path = signal_socket_path;
     let monitor = thread::spawn(move || {
         let mut warned = false;
         let mut last_status = Instant::now();
+        let mut last_emitted_state = THERMAL_STATE_NORMAL;
+        let mut last_signal = Instant::now()
+            .checked_sub(temp_check_interval)
+            .unwrap_or_else(Instant::now);
 
     while monitor_running.load(Ordering::Acquire) {
+        let mut current_temp: Option<f32> = None;
         if let Some(temperature_c) = read_cpu_temperature_c() {
+            current_temp = Some(temperature_c);
             if temperature_c >= critical_temp_c {
                 monitor_state.store(THERMAL_STATE_CRITICAL, Ordering::Release);
                 eprintln!(
@@ -221,6 +302,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     temperature_c,
                     critical_temp_c
                 );
+                if let (Some(socket), Some(path)) =
+                    (monitor_signal_socket.as_ref(), monitor_signal_path.as_deref())
+                {
+                    emit_thermal_signal(
+                        socket,
+                        path,
+                        THERMAL_STATE_CRITICAL,
+                        current_temp,
+                        warn_temp_c,
+                        critical_temp_c,
+                    );
+                }
                 monitor_running.store(false, Ordering::Release);
                 break;
             }
@@ -247,6 +340,25 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
         } else {
             eprintln!("Unable to read CPU temperature from /sys/class/thermal/*/temp");
+        }
+
+        let current_state = monitor_state.load(Ordering::Acquire);
+        let should_emit = current_state != last_emitted_state || last_signal.elapsed() >= temp_check_interval;
+        if should_emit {
+            if let (Some(socket), Some(path)) =
+                (monitor_signal_socket.as_ref(), monitor_signal_path.as_deref())
+            {
+                emit_thermal_signal(
+                    socket,
+                    path,
+                    current_state,
+                    current_temp,
+                    warn_temp_c,
+                    critical_temp_c,
+                );
+            }
+            last_signal = Instant::now();
+            last_emitted_state = current_state;
         }
 
         thread::sleep(temp_check_interval);
