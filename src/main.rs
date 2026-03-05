@@ -337,7 +337,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let monitor_signal_path = signal_socket_path;
     let monitor = thread::spawn(move || {
         let mut warned = false;
-        let mut last_status = Instant::now();
         let mut last_emitted_state = THERMAL_STATE_NORMAL;
         let mut last_signal = Instant::now()
             .checked_sub(temp_check_interval)
@@ -385,11 +384,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 println!("CPU temperature recovered to {:.1}°C", temperature_c);
                 warned = false;
             }
-
-                if last_status.elapsed() >= Duration::from_secs(30) {
-                    println!("CPU temperature: {:.1}°C", temperature_c);
-                    last_status = Instant::now();
-                }
         } else {
             eprintln!("Unable to read CPU temperature from /sys/class/thermal/*/temp");
         }
