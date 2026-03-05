@@ -103,7 +103,7 @@ Recommendation values:
 Example receiver:
 
 ```bash
-socat -u UNIX-RECV:/tmp/starlight-thermal.sock -
+socat -u UNIX-CONNECT:/tmp/starlight-thermal.sock -
 ```
 
 Then launch Starlight with signaling enabled:
