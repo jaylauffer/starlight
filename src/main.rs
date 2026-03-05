@@ -1,10 +1,14 @@
 use std::env;
-use std::fs::{read_to_string, OpenOptions};
+use std::fs::{read_to_string, remove_file, OpenOptions};
+use std::ffi::CString;
 use std::io::{self, Seek, SeekFrom, Write};
-use std::os::unix::net::UnixDatagram;
+use std::os::unix::fs::{FileTypeExt, MetadataExt};
+use std::os::unix::net::{UnixListener, UnixStream};
+use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::thread;
+use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 use std::time::{SystemTime, UNIX_EPOCH};
 use pnet::datalink::{self, Channel, Config};
@@ -161,19 +165,42 @@ fn unix_timestamp_seconds() -> u64 {
         .as_secs()
 }
 
-fn emit_thermal_signal(
-    socket: &UnixDatagram,
-    socket_path: &str,
+#[derive(Clone)]
+struct ThermalSignalPublisher {
+    clients: Arc<Mutex<Vec<UnixStream>>>,
+}
+
+impl ThermalSignalPublisher {
+    fn emit(&self, payload: &str) {
+        let mut clients = match self.clients.lock() {
+            Ok(clients) => clients,
+            Err(err) => {
+                eprintln!("Unable to lock thermal signal client list: {}", err);
+                return;
+            }
+        };
+
+        let mut next_clients = Vec::with_capacity(clients.len());
+        for mut client in clients.drain(..) {
+            if client.write_all(payload.as_bytes()).is_ok() && client.write_all(b"\n").is_ok() {
+                next_clients.push(client);
+            }
+        }
+        *clients = next_clients;
+    }
+}
+
+fn thermal_payload(
     state: u8,
     temperature_c: Option<f32>,
     warn_temp_c: f32,
     critical_temp_c: f32,
-) {
+) -> String {
     let temp_json = match temperature_c {
         Some(temp) => format!("{temp:.1}"),
         None => "null".to_string(),
     };
-    let payload = format!(
+    format!(
         "{{\"state\":\"{}\",\"temp_c\":{},\"warn_c\":{:.1},\"crit_c\":{:.1},\"ts\":{},\"recommendation\":\"{}\"}}",
         thermal_state_name(state),
         temp_json,
@@ -181,14 +208,106 @@ fn emit_thermal_signal(
         critical_temp_c,
         unix_timestamp_seconds(),
         thermal_recommendation(state),
-    );
+    )
+}
 
-    if let Err(err) = socket.send_to(payload.as_bytes(), socket_path) {
-        eprintln!(
-            "Unable to publish thermal signal to {}: {}",
-            socket_path, err
-        );
+fn emit_thermal_signal(
+    publisher: &ThermalSignalPublisher,
+    state: u8,
+    temperature_c: Option<f32>,
+    warn_temp_c: f32,
+    critical_temp_c: f32,
+) {
+    publisher.emit(&thermal_payload(
+        state,
+        temperature_c,
+        warn_temp_c,
+        critical_temp_c,
+    ));
+}
+
+fn initialize_signal_publisher(
+    path: &str,
+    owner: &str,
+    running: Arc<AtomicBool>,
+) -> io::Result<(ThermalSignalPublisher, JoinHandle<()>)> {
+    let socket_path = Path::new(path);
+    if socket_path.exists() {
+        let metadata = std::fs::metadata(socket_path)?;
+        if !metadata.file_type().is_socket() {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                format!("{path} exists and is not a Unix socket"),
+            ));
+        }
+        remove_file(socket_path)?;
     }
+
+    let listener = UnixListener::bind(socket_path)?;
+    listener.set_nonblocking(true)?;
+    ensure_socket_owner(path, owner)?;
+
+    let clients = Arc::new(Mutex::new(Vec::new()));
+    let accept_clients = Arc::clone(&clients);
+    let accept_handle = thread::spawn(move || {
+        while running.load(Ordering::Acquire) {
+            match listener.accept() {
+                Ok((stream, _)) => {
+                    if let Ok(mut clients) = accept_clients.lock() {
+                        clients.push(stream);
+                    }
+                }
+                Err(err) if err.kind() == io::ErrorKind::WouldBlock => {
+                    thread::sleep(Duration::from_millis(100));
+                }
+                Err(err) => {
+                    eprintln!("Thermal signal socket accept error: {}", err);
+                    break;
+                }
+            }
+        }
+    });
+
+    Ok((ThermalSignalPublisher { clients }, accept_handle))
+}
+
+fn lookup_user_ids(username: &str) -> io::Result<(u32, u32)> {
+    let c_username = CString::new(username)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "username contains NUL"))?;
+    let passwd_ptr = unsafe { libc::getpwnam(c_username.as_ptr()) };
+    if passwd_ptr.is_null() {
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            format!("user `{username}` not found"),
+        ));
+    }
+
+    let passwd = unsafe { *passwd_ptr };
+    Ok((passwd.pw_uid, passwd.pw_gid))
+}
+
+fn ensure_socket_owner(path: &str, username: &str) -> io::Result<()> {
+    let metadata = std::fs::metadata(path)?;
+    if !metadata.file_type().is_socket() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{path} is not a Unix socket"),
+        ));
+    }
+
+    let (uid, gid) = lookup_user_ids(username)?;
+    if metadata.uid() == uid && metadata.gid() == gid {
+        return Ok(());
+    }
+
+    let c_path = CString::new(path)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "socket path contains NUL"))?;
+    let rc = unsafe { libc::chown(c_path.as_ptr(), uid, gid) };
+    if rc != 0 {
+        return Err(io::Error::last_os_error());
+    }
+
+    Ok(())
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -241,11 +360,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .ok()
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty());
-    let signal_socket = if signal_socket_path.is_some() {
-        match UnixDatagram::unbound() {
-            Ok(socket) => Some(socket),
+    let signal_socket_owner = env::var("STARLIGHT_SIGNAL_SOCKET_OWNER")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| "starlight".to_string());
+    let running = Arc::new(AtomicBool::new(true));
+    let signal_publisher_setup = if let Some(path) = signal_socket_path.as_deref() {
+        match initialize_signal_publisher(path, &signal_socket_owner, Arc::clone(&running)) {
+            Ok(parts) => Some(parts),
             Err(err) => {
-                eprintln!("Unable to initialize signal socket publisher: {}", err);
+                eprintln!("Unable to initialize signal socket publisher on {}: {}", path, err);
                 None
             }
         }
@@ -274,18 +399,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         temp_check_interval
     );
     if let Some(path) = signal_socket_path.as_deref() {
-        println!("Thermal signal publisher enabled: {}", path);
+        println!("Thermal signal publisher listening on: {}", path);
     }
 
-    let running = Arc::new(AtomicBool::new(true));
     let thermal_state_arc = Arc::new(AtomicU8::new(THERMAL_STATE_NORMAL));
     let monitor_running = running.clone();
     let monitor_state = thermal_state_arc.clone();
-    let monitor_signal_socket = signal_socket;
-    let monitor_signal_path = signal_socket_path;
+    let monitor_signal_publisher = signal_publisher_setup
+        .as_ref()
+        .map(|(publisher, _)| publisher.clone());
     let monitor = thread::spawn(move || {
         let mut warned = false;
-        let mut last_status = Instant::now();
         let mut last_emitted_state = THERMAL_STATE_NORMAL;
         let mut last_signal = Instant::now()
             .checked_sub(temp_check_interval)
@@ -302,12 +426,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     temperature_c,
                     critical_temp_c
                 );
-                if let (Some(socket), Some(path)) =
-                    (monitor_signal_socket.as_ref(), monitor_signal_path.as_deref())
-                {
+                if let Some(publisher) = monitor_signal_publisher.as_ref() {
                     emit_thermal_signal(
-                        socket,
-                        path,
+                        publisher,
                         THERMAL_STATE_CRITICAL,
                         current_temp,
                         warn_temp_c,
@@ -333,11 +454,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 println!("CPU temperature recovered to {:.1}°C", temperature_c);
                 warned = false;
             }
-
-                if last_status.elapsed() >= Duration::from_secs(30) {
-                    println!("CPU temperature: {:.1}°C", temperature_c);
-                    last_status = Instant::now();
-                }
         } else {
             eprintln!("Unable to read CPU temperature from /sys/class/thermal/*/temp");
         }
@@ -345,12 +461,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let current_state = monitor_state.load(Ordering::Acquire);
         let should_emit = current_state != last_emitted_state || last_signal.elapsed() >= temp_check_interval;
         if should_emit {
-            if let (Some(socket), Some(path)) =
-                (monitor_signal_socket.as_ref(), monitor_signal_path.as_deref())
-            {
+            if let Some(publisher) = monitor_signal_publisher.as_ref() {
                 emit_thermal_signal(
-                    socket,
-                    path,
+                    publisher,
                     current_state,
                     current_temp,
                     warn_temp_c,
@@ -520,6 +633,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     running.store(false, Ordering::Release);
     if let Err(err) = monitor.join() {
         eprintln!("Temperature monitor thread failed: {:?}", err);
+    }
+    if let Some((_, accept_thread)) = signal_publisher_setup {
+        if let Err(err) = accept_thread.join() {
+            eprintln!("Thermal signal accept thread failed: {:?}", err);
+        }
+    }
+    if let Some(path) = signal_socket_path.as_deref() {
+        let _ = remove_file(path);
     }
 
     Ok(())
