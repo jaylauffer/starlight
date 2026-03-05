@@ -73,6 +73,7 @@ Defaults:
 - Stop at `85.0`°C (`STARLIGHT_CRIT_TEMP_C`)
 - Check interval `5` seconds (`STARLIGHT_TEMP_CHECK_INTERVAL_SECS`)
 - Optional Unix datagram signal socket (`STARLIGHT_SIGNAL_SOCKET`)
+- Signal socket owner user (`STARLIGHT_SIGNAL_SOCKET_OWNER`, default: `starlight`)
 
 When warning/critical thresholds are reached, Starlight overrides the network visualization and pulses the full 8x8 grid:
 
@@ -111,6 +112,9 @@ Then launch Starlight with signaling enabled:
 STARLIGHT_SIGNAL_SOCKET=/tmp/starlight-thermal.sock \
 sudo cargo run --manifest-path starlight/Cargo.toml --release -- eth0 /dev/fb1
 ```
+
+When signaling is enabled, Starlight attempts to set ownership of the socket path to
+`STARLIGHT_SIGNAL_SOCKET_OWNER` (default `starlight`).
 
 Useful on-console checks:
 

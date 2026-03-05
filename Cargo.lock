@@ -303,6 +303,7 @@ dependencies = [
 name = "starlight"
 version = "0.1.0"
 dependencies = [
+ "libc",
  "ndarray",
  "pnet",
  "rppal",

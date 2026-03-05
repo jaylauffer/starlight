@@ -1,6 +1,8 @@
 use std::env;
 use std::fs::{read_to_string, OpenOptions};
+use std::ffi::CString;
 use std::io::{self, Seek, SeekFrom, Write};
+use std::os::unix::fs::{FileTypeExt, MetadataExt};
 use std::os::unix::net::UnixDatagram;
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::Arc;
@@ -191,6 +193,45 @@ fn emit_thermal_signal(
     }
 }
 
+fn lookup_user_ids(username: &str) -> io::Result<(u32, u32)> {
+    let c_username = CString::new(username)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "username contains NUL"))?;
+    let passwd_ptr = unsafe { libc::getpwnam(c_username.as_ptr()) };
+    if passwd_ptr.is_null() {
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            format!("user `{username}` not found"),
+        ));
+    }
+
+    let passwd = unsafe { *passwd_ptr };
+    Ok((passwd.pw_uid, passwd.pw_gid))
+}
+
+fn ensure_socket_owner(path: &str, username: &str) -> io::Result<()> {
+    let metadata = std::fs::metadata(path)?;
+    if !metadata.file_type().is_socket() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{path} is not a Unix socket"),
+        ));
+    }
+
+    let (uid, gid) = lookup_user_ids(username)?;
+    if metadata.uid() == uid && metadata.gid() == gid {
+        return Ok(());
+    }
+
+    let c_path = CString::new(path)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "socket path contains NUL"))?;
+    let rc = unsafe { libc::chown(c_path.as_ptr(), uid, gid) };
+    if rc != 0 {
+        return Err(io::Error::last_os_error());
+    }
+
+    Ok(())
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
 /*     let host = cpal::default_host();
 
@@ -241,6 +282,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .ok()
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty());
+    let signal_socket_owner = env::var("STARLIGHT_SIGNAL_SOCKET_OWNER")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| "starlight".to_string());
     let signal_socket = if signal_socket_path.is_some() {
         match UnixDatagram::unbound() {
             Ok(socket) => Some(socket),
@@ -275,6 +321,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
     if let Some(path) = signal_socket_path.as_deref() {
         println!("Thermal signal publisher enabled: {}", path);
+        if let Err(err) = ensure_socket_owner(path, &signal_socket_owner) {
+            eprintln!(
+                "Unable to ensure Unix socket ownership for {} as {}: {}",
+                path, signal_socket_owner, err
+            );
+        }
     }
 
     let running = Arc::new(AtomicBool::new(true));
