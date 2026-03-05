@@ -72,6 +72,7 @@ Defaults:
 - Warn at `80.0`°C (`STARLIGHT_WARN_TEMP_C`)
 - Stop at `85.0`°C (`STARLIGHT_CRIT_TEMP_C`)
 - Check interval `5` seconds (`STARLIGHT_TEMP_CHECK_INTERVAL_SECS`)
+- Optional Unix datagram signal socket (`STARLIGHT_SIGNAL_SOCKET`)
 
 When warning/critical thresholds are reached, Starlight overrides the network visualization and pulses the full 8x8 grid:
 
@@ -82,6 +83,32 @@ All values are optional and can be overridden at launch time:
 
 ```bash
 STARLIGHT_WARN_TEMP_C=78 STARLIGHT_CRIT_TEMP_C=84 STARLIGHT_TEMP_CHECK_INTERVAL_SECS=2 \
+sudo cargo run --manifest-path starlight/Cargo.toml --release -- eth0 /dev/fb1
+```
+
+If `STARLIGHT_SIGNAL_SOCKET` is set, Starlight publishes JSON thermal status messages to that
+Unix datagram socket on state changes and once per monitor interval:
+
+```json
+{"state":"normal","temp_c":63.2,"warn_c":80.0,"crit_c":85.0,"ts":1710000000,"recommendation":"normal"}
+```
+
+Recommendation values:
+
+- `normal`: run normally
+- `throttle`: reduce command intensity/cadence
+- `pause`: pause non-essential work
+
+Example receiver:
+
+```bash
+socat -u UNIX-RECV:/tmp/starlight-thermal.sock -
+```
+
+Then launch Starlight with signaling enabled:
+
+```bash
+STARLIGHT_SIGNAL_SOCKET=/tmp/starlight-thermal.sock \
 sudo cargo run --manifest-path starlight/Cargo.toml --release -- eth0 /dev/fb1
 ```
 
