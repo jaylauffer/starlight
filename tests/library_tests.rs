@@ -10,10 +10,11 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use ndarray::{s, Array1};
 use starlight::{
-    bytes_to_f32_vector, ensure_socket_owner, initialize_signal_publisher, lookup_user_ids,
-    parse_temp_env, parse_temp_interval_env, thermal_payload, thermal_recommendation,
-    thermal_state_name, unix_timestamp_seconds, PacketCompressor, THERMAL_STATE_CRITICAL,
-    THERMAL_STATE_NORMAL, THERMAL_STATE_WARNING,
+    bytes_to_f32_vector, compressed_payload_to_frame_bytes, ensure_socket_owner,
+    initialize_signal_publisher, lookup_user_ids, packet_to_frame_bytes, parse_temp_env,
+    parse_temp_interval_env, thermal_payload, thermal_recommendation, thermal_state_name,
+    unix_timestamp_seconds, PacketCompressor, COMPRESSED_PACKET_SIZE, FRAMEBUFFER_SIZE_BYTES,
+    PACKET_VECTOR_SIZE, THERMAL_STATE_CRITICAL, THERMAL_STATE_NORMAL, THERMAL_STATE_WARNING,
 };
 
 fn env_lock() -> &'static Mutex<()> {
@@ -35,7 +36,10 @@ fn unique_path(name: &str) -> String {
 fn current_username() -> String {
     let uid = unsafe { libc::geteuid() };
     let passwd_ptr = unsafe { libc::getpwuid(uid) };
-    assert!(!passwd_ptr.is_null(), "current uid should resolve to a passwd entry");
+    assert!(
+        !passwd_ptr.is_null(),
+        "current uid should resolve to a passwd entry"
+    );
     let name = unsafe { std::ffi::CStr::from_ptr((*passwd_ptr).pw_name) };
     name.to_str().unwrap().to_string()
 }
@@ -81,7 +85,7 @@ fn compressor_is_deterministic_for_same_input() {
 #[test]
 fn bytes_to_f32_vector_pads_short_inputs() {
     let converted = bytes_to_f32_vector(&[0, 127, 255]);
-    assert_eq!(converted.len(), 1518);
+    assert_eq!(converted.len(), PACKET_VECTOR_SIZE);
     assert_eq!(converted[0], 0.0);
     assert!((converted[1] - (127.0 / 255.0)).abs() < 1e-6);
     assert_eq!(converted[2], 1.0);
@@ -92,8 +96,32 @@ fn bytes_to_f32_vector_pads_short_inputs() {
 fn bytes_to_f32_vector_truncates_long_inputs() {
     let bytes = vec![255u8; 1600];
     let converted = bytes_to_f32_vector(&bytes);
-    assert_eq!(converted.len(), 1518);
+    assert_eq!(converted.len(), PACKET_VECTOR_SIZE);
     assert!(converted.iter().all(|value| *value == 1.0));
+}
+
+#[test]
+fn compressed_payload_to_frame_bytes_serializes_in_little_endian_order() {
+    let frame = compressed_payload_to_frame_bytes(&Array1::from(vec![1.5, -2.0, 0.25]));
+    assert_eq!(frame.len(), FRAMEBUFFER_SIZE_BYTES);
+    assert_eq!(&frame[0..4], &1.5f32.to_le_bytes());
+    assert_eq!(&frame[4..8], &(-2.0f32).to_le_bytes());
+    assert_eq!(&frame[8..12], &0.25f32.to_le_bytes());
+}
+
+#[test]
+fn compressed_payload_to_frame_bytes_zero_fills_remaining_slots() {
+    let frame = compressed_payload_to_frame_bytes(&Array1::from(vec![3.0]));
+    for offset in (4..FRAMEBUFFER_SIZE_BYTES).step_by(4) {
+        assert_eq!(&frame[offset..offset + 4], &0.0f32.to_le_bytes());
+    }
+}
+
+#[test]
+fn packet_to_frame_bytes_returns_fixed_width_frame() {
+    let compressor = PacketCompressor::new(PACKET_VECTOR_SIZE, COMPRESSED_PACKET_SIZE);
+    let frame = packet_to_frame_bytes(&compressor, &[1, 2, 3, 4, 5]);
+    assert_eq!(frame.len(), FRAMEBUFFER_SIZE_BYTES);
 }
 
 #[test]

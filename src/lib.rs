@@ -18,6 +18,9 @@ use pnet::datalink::{self, Channel, Config};
 pub const THERMAL_STATE_NORMAL: u8 = 0;
 pub const THERMAL_STATE_WARNING: u8 = 1;
 pub const THERMAL_STATE_CRITICAL: u8 = 2;
+pub const PACKET_VECTOR_SIZE: usize = 1518;
+pub const COMPRESSED_PACKET_SIZE: usize = 32;
+pub const FRAMEBUFFER_SIZE_BYTES: usize = COMPRESSED_PACKET_SIZE * std::mem::size_of::<f32>();
 
 pub struct PacketCompressor {
     weights1: Array2<f32>,
@@ -83,17 +86,39 @@ impl PacketCompressor {
 }
 
 pub fn bytes_to_f32_vector(bytes: &[u8]) -> Array1<f32> {
-    const REQUIRED_SIZE: usize = 1518;
-
     let floats: Vec<f32> = bytes.iter().map(|&byte| byte as f32 / 255.0).collect();
 
-    if floats.len() >= REQUIRED_SIZE {
-        Array1::from(floats[..REQUIRED_SIZE].to_vec())
+    if floats.len() >= PACKET_VECTOR_SIZE {
+        Array1::from(floats[..PACKET_VECTOR_SIZE].to_vec())
     } else {
-        let mut padded = Array::zeros(REQUIRED_SIZE);
-        padded.slice_mut(s![..floats.len()]).assign(&Array1::from(floats));
+        let mut padded = Array::zeros(PACKET_VECTOR_SIZE);
+        padded
+            .slice_mut(s![..floats.len()])
+            .assign(&Array1::from(floats));
         padded
     }
+}
+
+pub fn compressed_payload_to_frame_bytes(compressed: &Array1<f32>) -> [u8; FRAMEBUFFER_SIZE_BYTES] {
+    let mut frame = [0u8; FRAMEBUFFER_SIZE_BYTES];
+    for (chunk, value) in frame.chunks_exact_mut(std::mem::size_of::<f32>()).zip(
+        compressed
+            .iter()
+            .copied()
+            .chain(std::iter::repeat(0.0))
+            .take(COMPRESSED_PACKET_SIZE),
+    ) {
+        chunk.copy_from_slice(&value.to_le_bytes());
+    }
+    frame
+}
+
+pub fn packet_to_frame_bytes(
+    compressor: &PacketCompressor,
+    packet: &[u8],
+) -> [u8; FRAMEBUFFER_SIZE_BYTES] {
+    let compressed = compressor.compress(bytes_to_f32_vector(packet));
+    compressed_payload_to_frame_bytes(&compressed)
 }
 
 pub fn parse_temp_env(var_name: &str, default: f32) -> f32 {
@@ -121,7 +146,11 @@ pub fn read_cpu_temperature_c() -> Option<f32> {
     for path in TEMP_PATHS {
         if let Ok(raw) = read_to_string(path) {
             if let Ok(parsed) = raw.trim().parse::<f32>() {
-                return Some(if parsed > 200.0 { parsed / 1000.0 } else { parsed });
+                return Some(if parsed > 200.0 {
+                    parsed / 1000.0
+                } else {
+                    parsed
+                });
             }
         }
     }
@@ -233,6 +262,7 @@ pub fn initialize_signal_publisher(
     let listener = UnixListener::bind(socket_path)?;
     listener.set_nonblocking(true)?;
     ensure_socket_owner(path, owner)?;
+    ensure_socket_mode(path, 0o660)?;
 
     let clients = Arc::new(Mutex::new(Vec::new()));
     let accept_clients = Arc::clone(&clients);
@@ -273,6 +303,24 @@ pub fn lookup_user_ids(username: &str) -> io::Result<(u32, u32)> {
     Ok((passwd.pw_uid, passwd.pw_gid))
 }
 
+pub fn current_effective_username() -> io::Result<String> {
+    let uid = unsafe { libc::geteuid() };
+    let passwd_ptr = unsafe { libc::getpwuid(uid) };
+    if passwd_ptr.is_null() {
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            format!("effective uid `{uid}` does not map to a passwd entry"),
+        ));
+    }
+
+    let passwd = unsafe { *passwd_ptr };
+    let username = unsafe { std::ffi::CStr::from_ptr(passwd.pw_name) }
+        .to_str()
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "passwd username is not utf-8"))?
+        .to_string();
+    Ok(username)
+}
+
 pub fn ensure_socket_owner(path: &str, username: &str) -> io::Result<()> {
     let metadata = std::fs::metadata(path)?;
     if !metadata.file_type().is_socket() {
@@ -290,6 +338,17 @@ pub fn ensure_socket_owner(path: &str, username: &str) -> io::Result<()> {
     let c_path = CString::new(path)
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "socket path contains NUL"))?;
     let rc = unsafe { libc::chown(c_path.as_ptr(), uid, gid) };
+    if rc != 0 {
+        return Err(io::Error::last_os_error());
+    }
+
+    Ok(())
+}
+
+pub fn ensure_socket_mode(path: &str, mode: u32) -> io::Result<()> {
+    let c_path = CString::new(path)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "socket path contains NUL"))?;
+    let rc = unsafe { libc::chmod(c_path.as_ptr(), mode) };
     if rc != 0 {
         return Err(io::Error::last_os_error());
     }
@@ -320,16 +379,27 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
         .ok()
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())
-        .unwrap_or_else(|| "starlight".to_string());
+        .map(Ok)
+        .unwrap_or_else(current_effective_username)?;
     let running = Arc::new(AtomicBool::new(true));
     let signal_publisher_setup = if let Some(path) = signal_socket_path.as_deref() {
-        match initialize_signal_publisher(path, &signal_socket_owner, Arc::clone(&running)) {
-            Ok(parts) => Some(parts),
-            Err(err) => {
-                eprintln!("Unable to initialize signal socket publisher on {}: {}", path, err);
-                None
-            }
-        }
+        let (uid, gid) = lookup_user_ids(&signal_socket_owner)?;
+        println!(
+            "Initializing thermal signal socket: path={} owner={} uid={} gid={} mode=0660",
+            path, signal_socket_owner, uid, gid
+        );
+        Some(
+            initialize_signal_publisher(path, &signal_socket_owner, Arc::clone(&running))
+                .map_err(|err| {
+                    io::Error::new(
+                        err.kind(),
+                        format!(
+                            "unable to initialize signal socket publisher on {} for owner {}: {}",
+                            path, signal_socket_owner, err
+                        ),
+                    )
+                })?,
+        )
     } else {
         None
     };
@@ -350,12 +420,13 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
 
     println!(
         "CPU monitor enabled: warning at {:.1}°C, shutdown at {:.1}°C (interval: {:?})",
-        warn_temp_c,
-        critical_temp_c,
-        temp_check_interval
+        warn_temp_c, critical_temp_c, temp_check_interval
     );
     if let Some(path) = signal_socket_path.as_deref() {
-        println!("Thermal signal publisher listening on: {}", path);
+        println!(
+            "Thermal signal publisher listening on: {} (owner: {}, mode: 0660)",
+            path, signal_socket_owner
+        );
     }
 
     let thermal_state_arc = Arc::new(AtomicU8::new(THERMAL_STATE_NORMAL));
@@ -476,10 +547,7 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
 
     println!("Listening on interface: {}", interface_name);
 
-    let input_size = 1518;
-    let compressed_size = 32;
-
-    let compressor = PacketCompressor::new(input_size, compressed_size);
+    let compressor = PacketCompressor::new(PACKET_VECTOR_SIZE, COMPRESSED_PACKET_SIZE);
     let mut warning_pulse = false;
     let mut last_warning_pulse_toggle = Instant::now();
     let warning_pulse_rate = Duration::from_millis(350);
@@ -520,13 +588,12 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
         }
 
         let current_thermal_state = thermal_state_arc.load(Ordering::Acquire);
-        let mut packet_data: Option<Array1<f32>> = None;
+        let mut frame_data: Option<[u8; FRAMEBUFFER_SIZE_BYTES]> = None;
 
         match channel.next() {
             Ok(packet) => {
                 if current_thermal_state == THERMAL_STATE_NORMAL {
-                    let compressed = compressor.compress(bytes_to_f32_vector(packet));
-                    packet_data = Some(compressed);
+                    frame_data = Some(packet_to_frame_bytes(&compressor, packet));
                 }
             }
             Err(e) => {
@@ -557,14 +624,8 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
             continue;
         }
 
-        if let Some(compressed) = packet_data {
-            let buffer: &[u8] = unsafe {
-                std::slice::from_raw_parts(
-                    compressed.as_ptr() as *const u8,
-                    compressed.len() * std::mem::size_of::<f32>(),
-                )
-            };
-            fb.write_all(buffer)?;
+        if let Some(frame) = frame_data {
+            fb.write_all(&frame)?;
             fb.seek(SeekFrom::Start(0))?;
         }
     }
