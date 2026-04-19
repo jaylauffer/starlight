@@ -1,7 +1,11 @@
 # Starlight on Raspberry Pi + Sense HAT
 
-This crate reads packets from a network interface and streams a compressed payload to the
-Sense HAT framebuffer.
+`starlight` is a Raspberry Pi display process that watches a network interface,
+compresses packet data into a compact numeric frame, and renders the result on
+the Sense HAT 8x8 LED matrix through the framebuffer.
+
+It is intended for small, hardware-facing network visualization experiments on
+Pi hardware rather than as a generic packet-capture daemon.
 
 ## Requirements
 
@@ -29,7 +33,7 @@ You should see `/dev/fb1` for Sense HAT.
 From the repo root:
 
 ```bash
-cargo build --release --manifest-path starlight/Cargo.toml
+cargo build --release
 ```
 
 ## Launch on Raspberry Pi
@@ -43,7 +47,7 @@ Example launch:
 
 ```bash
 cd /home/jay/pudding
-sudo cargo run --manifest-path starlight/Cargo.toml --release -- eth0 /dev/fb1
+sudo cargo run --release -- eth0 /dev/fb1
 ```
 
 If you prefer to avoid `sudo` for the long-running process:
@@ -73,9 +77,10 @@ Defaults:
 - Stop at `85.0`°C (`STARLIGHT_CRIT_TEMP_C`)
 - Check interval `5` seconds (`STARLIGHT_TEMP_CHECK_INTERVAL_SECS`)
 - Optional Unix domain signal socket (`STARLIGHT_SIGNAL_SOCKET`)
-- Signal socket owner user (`STARLIGHT_SIGNAL_SOCKET_OWNER`, default: `starlight`)
+- Signal socket owner user (`STARLIGHT_SIGNAL_SOCKET_OWNER`, default: current effective user)
 
-When warning/critical thresholds are reached, Starlight overrides the network visualization and pulses the full 8x8 grid:
+When warning or critical thresholds are reached, `starlight` overrides the
+network visualization and pulses the full 8x8 grid:
 
 - Warning: yellow
 - Critical: red (and capture stops)
@@ -84,7 +89,7 @@ All values are optional and can be overridden at launch time:
 
 ```bash
 STARLIGHT_WARN_TEMP_C=78 STARLIGHT_CRIT_TEMP_C=84 STARLIGHT_TEMP_CHECK_INTERVAL_SECS=2 \
-sudo cargo run --manifest-path starlight/Cargo.toml --release -- eth0 /dev/fb1
+sudo cargo run --release -- eth0 /dev/fb1
 ```
 
 If `STARLIGHT_SIGNAL_SOCKET` is set, Starlight binds that Unix socket path itself and publishes
@@ -107,15 +112,15 @@ Example receiver:
 socat -u UNIX-CONNECT:/tmp/starlight-thermal.sock STDOUT
 ```
 
-Then launch Starlight with signaling enabled:
+Then launch `starlight` with signaling enabled:
 
 ```bash
 STARLIGHT_SIGNAL_SOCKET=/tmp/starlight-thermal.sock \
-sudo cargo run --manifest-path starlight/Cargo.toml --release -- eth0 /dev/fb1
+sudo cargo run --release -- eth0 /dev/fb1
 ```
 
 When signaling is enabled, Starlight creates the socket path and attempts to set ownership of it to
-`STARLIGHT_SIGNAL_SOCKET_OWNER` (default `starlight`).
+`STARLIGHT_SIGNAL_SOCKET_OWNER` (default: current effective user).
 
 Useful on-console checks:
 
@@ -129,5 +134,5 @@ vcgencmd measure_temp
 - The current program writes directly to the framebuffer; if `/dev/fb1` is missing or a
   different device, confirm the kernel overlay and Sense HAT connection.
 - On successful start you should see immediate LED activity and then live packet-driven updates.
-- Operational hardening and recovery expectations are documented in
+- Runtime hardening and recovery expectations are documented in
   [docs/RESILIENCE_PLAN.md](docs/RESILIENCE_PLAN.md).

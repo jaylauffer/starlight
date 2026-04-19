@@ -7,7 +7,9 @@ hardware-facing output path. It should survive normal warm operation, recover
 cleanly from crashes, and provide a stable Unix socket surface for local
 supervision.
 
-This note defines the operational target before additional implementation work.
+This document describes the operational target for a public-facing, unattended
+deployment posture. It distinguishes current behavior from the hardening work
+that still needs to happen.
 
 ## Current State
 
@@ -32,7 +34,7 @@ The main risks on a Pi 4 are:
 - stale clients holding on to a dead Unix socket path
 - partial startup leaving the process unavailable until a human intervenes
 
-The target is not "never die." The target is:
+The target is not "never fail." The target is:
 
 - fail predictably
 - restart automatically
@@ -65,9 +67,10 @@ Use three thermal bands rather than treating every warm condition as fatal.
 - if temperature continues to rise or internal errors accumulate, exit cleanly
   and rely on the supervisor to restart later
 
-The current README defaults of warn `80 C` and stop `85 C` are still useful,
-but the implementation should move toward these operating bands so the process
-degrades instead of falling off a cliff.
+The current implementation still uses the simpler warn `80 C` and stop `85 C`
+thresholds documented in [README.md](../README.md). The longer-term target is
+to move toward these operating bands so the process degrades instead of
+falling off a cliff.
 
 ## Supervisor Model
 
@@ -101,12 +104,8 @@ Requirements:
 - stale socket cleanup on startup
 - bind failure should produce a clear log message
 - clients must expect reconnects
-- messages should include enough state to determine whether the process is:
-  - starting
-  - normal
-  - warm
-  - critical
-  - shutting down
+- messages should include enough state to distinguish startup, normal
+  operation, warm operation, critical operation, and shutdown
 
 Recommended direction:
 
@@ -150,12 +149,12 @@ On restart, `starlight` should:
 5. attempt framebuffer setup
 6. publish a startup status event
 
-If packet capture fails but the socket and thermal monitor are healthy, consider
-remaining alive in degraded mode so operators can still inspect state instead of
-losing the entire process.
+If packet capture fails but the socket and thermal monitor are healthy, prefer
+remaining alive in degraded mode so operators can still inspect state instead
+of losing the entire process.
 
-If framebuffer output fails but capture works, the same logic applies: prefer a
-degraded, observable state over immediate silent death.
+If framebuffer output fails but capture works, the same logic applies: prefer
+an observable degraded state over immediate silent death.
 
 ## Logging And Diagnostics
 
@@ -169,7 +168,8 @@ The process should emit explicit logs for:
 - degraded-mode transitions
 - panic or fatal-exit reasons
 
-At minimum, every unexpected exit should leave a reason visible in `journalctl`.
+At minimum, every unexpected exit should leave a clear reason visible in
+`journalctl`.
 
 ## Backoff Policy
 
@@ -186,7 +186,7 @@ When the board enters the critical band:
 - if needed, exit cleanly after a short cooldown grace period rather than
   thrashing
 
-The goal is to avoid making the hot condition worse through recovery work.
+The goal is to avoid making a hot condition worse through recovery work.
 
 ## Implementation Order
 
