@@ -46,8 +46,7 @@ cargo build --release
 Example launch:
 
 ```bash
-cd /home/jay/pudding
-sudo cargo run --release -- eth0 /dev/fb1
+cargo run --release -- eth0 /dev/fb1
 ```
 
 If you prefer to avoid `sudo` for the long-running process:
