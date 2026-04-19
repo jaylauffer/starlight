@@ -129,3 +129,5 @@ vcgencmd measure_temp
 - The current program writes directly to the framebuffer; if `/dev/fb1` is missing or a
   different device, confirm the kernel overlay and Sense HAT connection.
 - On successful start you should see immediate LED activity and then live packet-driven updates.
+- Operational hardening and recovery expectations are documented in
+  [docs/RESILIENCE_PLAN.md](docs/RESILIENCE_PLAN.md).
