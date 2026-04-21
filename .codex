@@ -1,0 +1,197 @@
+# Starlight Codex Notes
+
+## Purpose
+
+`starlight` is a Raspberry Pi + Sense HAT network visualizer.
+It captures packets from a selected interface, compresses packet bytes into a
+small numeric frame, writes directly to the framebuffer, and monitors Pi CPU
+thermals so the device can warn, throttle operator expectations, or stop
+capture before overheating.
+
+This repo is separate from `loadngo`, but should inherit the same collaboration
+discipline:
+
+- keep changes scoped to one repo
+- keep `main` clean
+- rebase instead of merge
+- document operational behavior clearly
+- prefer explicit validation over guesswork
+
+## Read First
+
+Before editing or publishing, read:
+
+1. `README.md`
+2. `docs/RESILIENCE_PLAN.md`
+3. `/home/jay/pudding/AGENTS.md`
+4. `/home/jay/pudding/docs/pudding-cloud-archive.md`
+5. `loadngo/README.md`
+6. `loadngo/COLLABORATION.md`
+7. `loadngo/docs/TASK_OFFER_PROTOCOL.md`
+8. `loadngo/docs/TASK_EXECUTION_TEST_PLAN.md`
+9. `loadngo/docs/TASK_REWARD_FLOW.md`
+10. `loadngo/docs/WORKER_FIRST_TASK_MODEL.md`
+11. `loadngo/docs/FIELD_NETWORK_BACKLOG.md`
+
+The `loadngo` docs matter here for workflow, ownership, and public-facing doc
+quality, not because `starlight` shares code with `loadngo`.
+
+## Workspace Context
+
+`pudding/docs/pudding-cloud-archive.md` defines the workspace-level archive and
+recovery posture: signed immutable workspace snapshots, local key custody, and
+digest verification before restore. That is part of the operational backdrop
+for any public or unattended repo in this workspace.
+
+The current `loadngo` network model is submitter-driven:
+
+- one multicast `TaskRequest` on the discovery plane
+- direct unicast `TaskOffer` replies from workers
+- explicit `TaskAccept` from the submitter
+- direct `TaskStatus`, `TaskResult`, and `TaskAck` after selection
+- qcoin reward only after acknowledged completion and durable visibility
+
+Current lab operations are centered on:
+
+- IPv6 multicast discovery for task requests
+- direct worker follow-up over unicast
+- explicit worker activation rather than assuming a skill means "listening"
+- standing worker posture via `task-node`
+- bounded/manual worker posture via `task_worker`
+- submitter-side coordination and qcoin closure via `task_submitter`
+
+Representative lab notes:
+
+- `TASK_EXECUTION_TEST_PLAN.md` uses MacMini as submitter and `agnes`,
+  `dolores`, and `gretta` as example workers
+- `TASK_OFFER_EXECUTION_20260419.md` records a real multicast advertisement,
+  no-worker timeout, self-execution fallback, and qcoin transaction submission
+
+This matters for `starlight` because the device can serve as a constrained
+radio-adjacent observer on the same workspace network, and its thermal state
+should be treated as an operational input when deciding whether it should do
+more than minimal observation or signaling.
+
+## Repo Facts
+
+- Main crate: `src/lib.rs`
+- Binary entrypoint: `src/main.rs`
+- Tests: `tests/library_tests.rs`
+- Headless launcher: `launch-headless.sh`
+- Git remote: `git@github.com:jaylauffer/starlight.git`
+
+## Runtime Model
+
+Launch arguments:
+
+1. network interface name
+2. framebuffer path
+
+Example:
+
+```bash
+cargo run --release -- eth0 /dev/fb1
+```
+
+Headless example:
+
+```bash
+./launch-headless.sh
+```
+
+## Thermal Monitoring
+
+Environment variables:
+
+- `STARLIGHT_WARN_TEMP_C` default `80.0`
+- `STARLIGHT_CRIT_TEMP_C` default `85.0`
+- `STARLIGHT_TEMP_CHECK_INTERVAL_SECS` default `5`
+- `STARLIGHT_SIGNAL_SOCKET` optional Unix socket path
+- `STARLIGHT_SIGNAL_SOCKET_OWNER` optional socket owner user
+
+Current behavior from `src/lib.rs`:
+
+- reads `/sys/class/thermal/thermal_zone0/temp` then `thermal_zone1/temp`
+- emits newline-delimited JSON thermal status on the optional Unix socket
+- pulses yellow on warning
+- pulses red on critical and stops capture
+
+Useful checks:
+
+```bash
+cat /sys/class/thermal/thermal_zone0/temp
+vcgencmd measure_temp
+```
+
+Socket listener example:
+
+```bash
+socat -u UNIX-CONNECT:/tmp/starlight-thermal.sock STDOUT
+```
+
+## Build And Test
+
+Run from `starlight/`:
+
+```bash
+cargo fmt
+cargo test
+cargo build --release
+```
+
+Prefer adding regression tests in `tests/library_tests.rs` when changing:
+
+- thermal payloads
+- socket lifecycle
+- environment parsing
+- packet-to-frame conversion behavior
+
+## Git And GitHub Workflow
+
+`starlight` is already connected to GitHub through `origin`.
+
+Recommended workflow:
+
+```bash
+git checkout -b jay/<device>/<topic>
+cargo test
+git add .
+git commit -m "Short imperative summary"
+git push -u origin jay/<device>/<topic>
+```
+
+Rules:
+
+- do not commit directly on `main`
+- use `git fetch` + `git rebase origin/main` before publishing
+- do not create merge commits
+- keep one logical change per commit
+- include validation details in the PR description
+
+Suggested PR description sections:
+
+- what changed
+- why it changed
+- files touched
+- validation run
+- Raspberry Pi or thermal behavior notes if relevant
+
+## Publishing Checklist
+
+Before calling the repo "live" on GitHub:
+
+1. Ensure `README.md` matches actual runtime behavior.
+2. Ensure `docs/RESILIENCE_PLAN.md` reflects current limits and next steps.
+3. Run `cargo test`.
+4. Confirm the launch path and thermal socket example still work.
+5. Commit `.codex` only if these notes are meant to guide future Codex sessions in-repo.
+
+## Editing Priorities
+
+High-value improvements for public readiness:
+
+- add a `systemd` service file
+- extend status events beyond thermal-only payloads
+- support degraded mode instead of immediate full shutdown where practical
+- improve startup and failure logging
+- document Raspberry Pi deployment and permissions more explicitly
