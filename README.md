@@ -7,26 +7,44 @@ the Sense HAT 8x8 LED matrix through the framebuffer.
 It is intended for small, hardware-facing network visualization experiments on
 Pi hardware rather than as a generic packet-capture daemon.
 
+## Runtime model
+
+Every I/O source runs on one `Proactor<IoUringPort>` from
+[`loadngo-proactor`](https://github.com/jaylauffer/loadngo): packet capture is
+an `IoPort::recv` on an `AF_PACKET` socket, framebuffer updates are
+`IoPort::write`, the thermal interval is a proactor deferred timer, and thermal
+subscribers are fed with `IoPort::send`. The process runs a single thread.
+See [src/runtime.rs](src/runtime.rs) for the mapping and
+[docs/RESILIENCE_PLAN.md](docs/RESILIENCE_PLAN.md) for the operational target.
+
 ## Requirements
 
 - Raspberry Pi with Sense HAT attached and working under Raspberry Pi OS.
 - Rust toolchain on the Pi (`curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh`).
 - Capturing on a network interface (`CAP_NET_RAW`), which typically requires root unless the
   binary is granted capabilities.
-- Sense HAT framebuffer exposed as `/dev/fb1` (common default for Sense HAT).
+- A Linux kernel with `io_uring` available to userspace.
+- The Sense HAT framebuffer device (see below).
 
 ## Prepare Sense HAT framebuffer
 
 1. Enable the Sense HAT overlay in `/boot/config.txt` (or use Raspberry Pi config tools):
    - ensure `dtoverlay=rpi-sense`.
 2. Reboot.
-3. Verify framebuffer devices:
+3. Find the framebuffer **by name, not by index**:
 
 ```bash
-ls /dev/fb*
+for f in /sys/class/graphics/fb*; do echo "$f -> $(cat "$f/name")"; done
 ```
 
-You should see `/dev/fb1` for Sense HAT.
+The Sense HAT matrix is whichever one reports `RPi-Sense FB`. It is an 8x8,
+16bpp, 128-byte device.
+
+The index is **not stable**: it moves with HDMI state and kernel/overlay
+changes, and it is commonly `/dev/fb0` rather than the `/dev/fb1` older notes
+assume. Passing a path that does not exist makes `starlight` initialize its
+thermal socket and then exit with `No such file or directory` before capture
+ever starts, so resolve the name rather than hardcoding an index.
 
 ## Build
 
@@ -46,7 +64,7 @@ cargo build --release
 Example launch:
 
 ```bash
-cargo run --release -- eth0 /dev/fb1
+cargo run --release -- eth0 "$(scripts/sense-hat-fb.sh)"
 ```
 
 If you prefer to avoid `sudo` for the long-running process:
@@ -60,7 +78,7 @@ sudo setcap cap_net_raw,cap_net_admin+eip starlight/target/release/starlight
 Then run:
 
 ```bash
-starlight/target/release/starlight eth0 /dev/fb1
+starlight/target/release/starlight eth0 "$(scripts/sense-hat-fb.sh)"
 ```
 
 Use your actual interface name (`ip link show`) if it is not `eth0`.
@@ -88,7 +106,7 @@ All values are optional and can be overridden at launch time:
 
 ```bash
 STARLIGHT_WARN_TEMP_C=78 STARLIGHT_CRIT_TEMP_C=84 STARLIGHT_TEMP_CHECK_INTERVAL_SECS=2 \
-sudo cargo run --release -- eth0 /dev/fb1
+sudo cargo run --release -- eth0 "$(scripts/sense-hat-fb.sh)"
 ```
 
 If `STARLIGHT_SIGNAL_SOCKET` is set, Starlight binds that Unix socket path itself and publishes
@@ -115,7 +133,7 @@ Then launch `starlight` with signaling enabled:
 
 ```bash
 STARLIGHT_SIGNAL_SOCKET=/tmp/starlight-thermal.sock \
-sudo cargo run --release -- eth0 /dev/fb1
+sudo cargo run --release -- eth0 "$(scripts/sense-hat-fb.sh)"
 ```
 
 When signaling is enabled, Starlight creates the socket path and attempts to set ownership of it to
@@ -130,8 +148,9 @@ vcgencmd measure_temp
 
 ## Notes
 
-- The current program writes directly to the framebuffer; if `/dev/fb1` is missing or a
-  different device, confirm the kernel overlay and Sense HAT connection.
+- The program writes directly to the framebuffer; if the device is missing, confirm the
+  kernel overlay and Sense HAT connection, and re-resolve the path by name (see
+  "Prepare Sense HAT framebuffer") rather than assuming an index.
 - On successful start you should see immediate LED activity and then live packet-driven updates.
 - Runtime hardening and recovery expectations are documented in
   [docs/RESILIENCE_PLAN.md](docs/RESILIENCE_PLAN.md).

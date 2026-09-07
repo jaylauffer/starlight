@@ -1,0 +1,33 @@
+[Unit]
+Description=Starlight Sense HAT network display
+After=network-online.target
+Wants=network-online.target
+# Bounded restarts. A misconfigured framebuffer path exits nonzero
+# immediately, and with Restart=on-failure alone that becomes a restart
+# every RestartSec forever; bounded, it lands in `failed` and stays
+# visible in `systemctl status`. See docs/RESILIENCE_PLAN.md,
+# "Supervisor Model". These are [Unit] directives -- systemd ignores them
+# under [Service].
+StartLimitIntervalSec=60
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/home/jay/pudding/starlight
+Environment=STARLIGHT_SIGNAL_SOCKET=/run/starlight/thermal.sock
+Environment=STARLIGHT_SIGNAL_SOCKET_OWNER=jay
+# The framebuffer is resolved by name at start rather than hardcoded.
+# Its index moves with HDMI state and kernel/overlay changes -- this unit
+# previously named /dev/fb1, which does not exist on the Pi 4 it was
+# installed on, so the service could only ever have failed. systemd does
+# no command substitution of its own, hence the `sh -c` wrapper.
+ExecStart=/bin/sh -c 'exec /home/jay/pudding/starlight/target/release/starlight eth0 "$(/home/jay/pudding/starlight/scripts/sense-hat-fb.sh)"'
+Restart=on-failure
+RestartSec=2
+RuntimeDirectory=starlight
+RuntimeDirectoryMode=0775
+NoNewPrivileges=false
+
+[Install]
+WantedBy=multi-user.target
