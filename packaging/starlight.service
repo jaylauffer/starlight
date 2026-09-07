@@ -25,6 +25,12 @@ Environment=STARLIGHT_SIGNAL_SOCKET_OWNER=jay
 ExecStart=/bin/sh -c 'exec /home/jay/pudding/starlight/target/release/starlight eth0 "$(/home/jay/pudding/starlight/scripts/sense-hat-fb.sh)"'
 Restart=on-failure
 RestartSec=2
+# A framebuffer retains its last frame after the writer exits, so a
+# stopped or crashed starlight otherwise leaves a stale pattern lit on the
+# HAT that is indistinguishable from a hung process. ExecStopPost runs on
+# every stop path including SIGKILL and crashes, which an in-process
+# signal handler would not cover.
+ExecStopPost=/home/jay/pudding/starlight/scripts/blank-sense-hat.sh
 RuntimeDirectory=starlight
 RuntimeDirectoryMode=0775
 NoNewPrivileges=false
