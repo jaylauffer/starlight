@@ -1,19 +1,25 @@
 use std::env;
 use std::f32::consts::PI;
 use std::ffi::CString;
-use std::fs::{read_to_string, remove_file, OpenOptions};
-use std::io::{self, Seek, SeekFrom, Write};
+use std::fs::{read_to_string, remove_file};
+use std::io;
+use std::os::fd::AsRawFd;
 use std::os::unix::fs::{FileTypeExt, MetadataExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
-use std::thread;
-use std::thread::JoinHandle;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{SystemTime, UNIX_EPOCH};
 
+use loadngo_proactor::{IoBuf, IoPort, IoResult, ProactorHandle};
 use ndarray::{s, Array, Array1, Array2};
-use pnet::datalink::{self, Channel, Config};
+
+/// Re-exported so integration tests (and any external supervisor) can
+/// construct the same proactor this crate runs on without repeating the
+/// git dependency.
+pub use loadngo_proactor;
+
+#[cfg(target_os = "linux")]
+pub mod runtime;
 
 pub const THERMAL_STATE_NORMAL: u8 = 0;
 pub const THERMAL_STATE_WARNING: u8 = 1;
@@ -181,14 +187,43 @@ pub fn unix_timestamp_seconds() -> u64 {
         .as_secs()
 }
 
-#[derive(Clone)]
+/// The set of connected thermal-status subscribers.
+///
+/// Clients are held as `Arc<UnixStream>` rather than plain `UnixStream`
+/// specifically because sends are now asynchronous: an `IoPort::send` is
+/// submitted to the kernel and completes later, so dropping the stream
+/// (and closing its fd) the moment a write fails would let the fd be
+/// closed -- and possibly reused by an unrelated `open` -- while the
+/// kernel still holds a reference to it for an in-flight send. Each
+/// submission moves an `Arc` clone into its own completion handler, so
+/// the fd cannot close until that specific send has completed.
+#[derive(Clone, Default)]
 pub struct ThermalSignalPublisher {
-    clients: Arc<Mutex<Vec<UnixStream>>>,
+    clients: Arc<Mutex<Vec<Arc<UnixStream>>>>,
 }
 
 impl ThermalSignalPublisher {
-    pub fn emit(&self, payload: &str) {
-        let mut clients = match self.clients.lock() {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Adds a freshly accepted subscriber.
+    pub fn add_client(&self, stream: UnixStream) {
+        match self.clients.lock() {
+            Ok(mut clients) => clients.push(Arc::new(stream)),
+            Err(err) => eprintln!("Unable to lock thermal signal client list: {}", err),
+        }
+    }
+
+    pub fn client_count(&self) -> usize {
+        self.clients.lock().map(|c| c.len()).unwrap_or(0)
+    }
+
+    /// Publishes one newline-delimited payload to every subscriber as a
+    /// real `IoPort::send`, rather than a blocking `write_all` on the
+    /// caller's thread. A send that fails drops just that subscriber.
+    pub fn emit_via<P: IoPort>(&self, handle: &ProactorHandle<P>, payload: &str) {
+        let clients = match self.clients.lock() {
             Ok(clients) => clients,
             Err(err) => {
                 eprintln!("Unable to lock thermal signal client list: {}", err);
@@ -196,13 +231,33 @@ impl ThermalSignalPublisher {
             }
         };
 
-        let mut next_clients = Vec::with_capacity(clients.len());
-        for mut client in clients.drain(..) {
-            if client.write_all(payload.as_bytes()).is_ok() && client.write_all(b"\n").is_ok() {
-                next_clients.push(client);
+        let mut line = Vec::with_capacity(payload.len() + 1);
+        line.extend_from_slice(payload.as_bytes());
+        line.push(b'\n');
+
+        for client in clients.iter() {
+            let fd = client.as_raw_fd();
+            // Keeps this client's fd open for the whole in-flight send,
+            // and identifies it for removal if the send fails.
+            let keep = Arc::clone(client);
+            let list = Arc::clone(&self.clients);
+            let submitted = handle.send(
+                fd,
+                IoBuf::from_vec(line.clone()),
+                move |result: IoResult| {
+                    if result.is_err() {
+                        if let Ok(mut clients) = list.lock() {
+                            clients.retain(|c| !Arc::ptr_eq(c, &keep));
+                        }
+                    }
+                    drop(keep);
+                },
+            );
+
+            if let Err(err) = submitted {
+                eprintln!("Unable to submit thermal signal send: {}", err);
             }
         }
-        *clients = next_clients;
     }
 }
 
@@ -227,26 +282,34 @@ pub fn thermal_payload(
     )
 }
 
-pub fn emit_thermal_signal(
+pub fn emit_thermal_signal<P: IoPort>(
     publisher: &ThermalSignalPublisher,
+    handle: &ProactorHandle<P>,
     state: u8,
     temperature_c: Option<f32>,
     warn_temp_c: f32,
     critical_temp_c: f32,
 ) {
-    publisher.emit(&thermal_payload(
-        state,
-        temperature_c,
-        warn_temp_c,
-        critical_temp_c,
-    ));
+    publisher.emit_via(
+        handle,
+        &thermal_payload(state, temperature_c, warn_temp_c, critical_temp_c),
+    );
 }
 
-pub fn initialize_signal_publisher(
+/// Binds the thermal signal socket and returns it alongside an empty
+/// publisher.
+///
+/// This used to also spawn a dedicated accept thread that polled a
+/// non-blocking `accept()` on a 100ms `thread::sleep` loop. That thread
+/// is gone: the listener is now registered with the proactor and drained
+/// only when the kernel reports it readable (see
+/// [`runtime::serve`]). The listener is still returned in non-blocking
+/// mode, which is what makes the readiness-driven drain loop terminate
+/// on `WouldBlock` instead of stalling the proactor thread.
+pub fn bind_signal_socket(
     path: &str,
     owner: &str,
-    running: Arc<AtomicBool>,
-) -> io::Result<(ThermalSignalPublisher, JoinHandle<()>)> {
+) -> io::Result<(UnixListener, ThermalSignalPublisher)> {
     let socket_path = Path::new(path);
     if socket_path.exists() {
         let metadata = std::fs::metadata(socket_path)?;
@@ -264,28 +327,34 @@ pub fn initialize_signal_publisher(
     ensure_socket_owner(path, owner)?;
     ensure_socket_mode(path, 0o660)?;
 
-    let clients = Arc::new(Mutex::new(Vec::new()));
-    let accept_clients = Arc::clone(&clients);
-    let accept_handle = thread::spawn(move || {
-        while running.load(Ordering::Acquire) {
-            match listener.accept() {
-                Ok((stream, _)) => {
-                    if let Ok(mut clients) = accept_clients.lock() {
-                        clients.push(stream);
-                    }
-                }
-                Err(err) if err.kind() == io::ErrorKind::WouldBlock => {
-                    thread::sleep(Duration::from_millis(100));
-                }
-                Err(err) => {
-                    eprintln!("Thermal signal socket accept error: {}", err);
-                    break;
-                }
+    Ok((listener, ThermalSignalPublisher::new()))
+}
+
+/// Drains every connection currently pending on the listener into the
+/// publisher, stopping at `WouldBlock`.
+///
+/// Deliberately not `IoPort::accept`: that call reports the peer as a
+/// `std::net::SocketAddr`, which it obtains through
+/// `socket2::SockAddr::as_socket()`. For an `AF_UNIX` peer that returns
+/// `None`, so the completion arrives as
+/// `Err(InvalidData, "accept completed but the peer address family was
+/// unrecognized")` -- and the already-accepted fd carried by that
+/// completion is dropped without being closed, leaking one fd per
+/// connection. `IoPort::accept` is IP-only today; a Unix listener has to
+/// go through readiness plus a plain `accept()` until it grows an
+/// address-family-agnostic completion type.
+pub fn drain_pending_clients(listener: &UnixListener, publisher: &ThermalSignalPublisher) {
+    loop {
+        match listener.accept() {
+            Ok((stream, _)) => publisher.add_client(stream),
+            Err(err) if err.kind() == io::ErrorKind::WouldBlock => return,
+            Err(err) if err.kind() == io::ErrorKind::Interrupted => continue,
+            Err(err) => {
+                eprintln!("Thermal signal socket accept error: {}", err);
+                return;
             }
         }
-    });
-
-    Ok((ThermalSignalPublisher { clients }, accept_handle))
+    }
 }
 
 pub fn lookup_user_ids(username: &str) -> io::Result<(u32, u32)> {
@@ -348,7 +417,9 @@ pub fn ensure_socket_owner(path: &str, username: &str) -> io::Result<()> {
 pub fn ensure_socket_mode(path: &str, mode: u32) -> io::Result<()> {
     let c_path = CString::new(path)
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "socket path contains NUL"))?;
-    let rc = unsafe { libc::chmod(c_path.as_ptr(), mode) };
+    // `mode_t` is u32 on Linux but u16 on the BSDs/macOS, so the cast is
+    // what lets this crate type-check off-target as well as on the Pi.
+    let rc = unsafe { libc::chmod(c_path.as_ptr(), mode as libc::mode_t) };
     if rc != 0 {
         return Err(io::Error::last_os_error());
     }
@@ -356,292 +427,78 @@ pub fn ensure_socket_mode(path: &str, mode: u32) -> io::Result<()> {
     Ok(())
 }
 
+/// Parsed launch configuration, shared by every runtime path.
+pub struct Config {
+    pub interface_name: String,
+    pub framebuffer_path: String,
+    pub warn_temp_c: f32,
+    pub critical_temp_c: f32,
+    pub temp_check_interval: std::time::Duration,
+    pub signal_socket_path: Option<String>,
+    pub signal_socket_owner: String,
+}
+
+impl Config {
+    pub fn from_env_and_args() -> Result<Self, Box<dyn std::error::Error>> {
+        let mut args = env::args().skip(1);
+        let interface_name = args
+            .next()
+            .ok_or("Usage: starlight <interface_name> <framebuffer_name>")?;
+        let framebuffer_path = args
+            .next()
+            .ok_or("Usage: starlight <interface_name> <framebuffer_name>")?;
+
+        let warn_temp_c = parse_temp_env("STARLIGHT_WARN_TEMP_C", 80.0);
+        let critical_temp_c = parse_temp_env("STARLIGHT_CRIT_TEMP_C", 85.0);
+        let temp_check_interval = std::time::Duration::from_secs(parse_temp_interval_env(
+            "STARLIGHT_TEMP_CHECK_INTERVAL_SECS",
+            5,
+        ));
+
+        if critical_temp_c <= warn_temp_c {
+            return Err(format!(
+                "Environment config invalid: STARLIGHT_CRIT_TEMP_C ({critical_temp_c:.1}) must be higher than STARLIGHT_WARN_TEMP_C ({warn_temp_c:.1})"
+            )
+            .into());
+        }
+
+        let signal_socket_path = env::var("STARLIGHT_SIGNAL_SOCKET")
+            .ok()
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty());
+        let signal_socket_owner = env::var("STARLIGHT_SIGNAL_SOCKET_OWNER")
+            .ok()
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+            .map(Ok)
+            .unwrap_or_else(current_effective_username)?;
+
+        Ok(Self {
+            interface_name,
+            framebuffer_path,
+            warn_temp_c,
+            critical_temp_c,
+            temp_check_interval,
+            signal_socket_path,
+            signal_socket_owner,
+        })
+    }
+}
+
+#[cfg(target_os = "linux")]
 pub fn run() -> Result<(), Box<dyn std::error::Error>> {
-    let mut args = env::args().skip(1);
-    let interface_name = args
-        .next()
-        .expect("Usage: cargo run <interface_name> <framebuffer_name>");
-    let fbuffer = args
-        .next()
-        .expect("Usage: cargo run <interface_name> <framebuffer_name>");
+    runtime::serve(Config::from_env_and_args()?)
+}
 
-    let warn_temp_c = parse_temp_env("STARLIGHT_WARN_TEMP_C", 80.0);
-    let critical_temp_c = parse_temp_env("STARLIGHT_CRIT_TEMP_C", 85.0);
-    let temp_check_interval = Duration::from_secs(parse_temp_interval_env(
-        "STARLIGHT_TEMP_CHECK_INTERVAL_SECS",
-        5,
-    ));
-    let signal_socket_path = env::var("STARLIGHT_SIGNAL_SOCKET")
-        .ok()
-        .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty());
-    let signal_socket_owner = env::var("STARLIGHT_SIGNAL_SOCKET_OWNER")
-        .ok()
-        .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty())
-        .map(Ok)
-        .unwrap_or_else(current_effective_username)?;
-    let running = Arc::new(AtomicBool::new(true));
-    let signal_publisher_setup = if let Some(path) = signal_socket_path.as_deref() {
-        let (uid, gid) = lookup_user_ids(&signal_socket_owner)?;
-        println!(
-            "Initializing thermal signal socket: path={} owner={} uid={} gid={} mode=0660",
-            path, signal_socket_owner, uid, gid
-        );
-        Some(
-            initialize_signal_publisher(path, &signal_socket_owner, Arc::clone(&running))
-                .map_err(|err| {
-                    io::Error::new(
-                        err.kind(),
-                        format!(
-                            "unable to initialize signal socket publisher on {} for owner {}: {}",
-                            path, signal_socket_owner, err
-                        ),
-                    )
-                })?,
-        )
-    } else {
-        None
-    };
-
-    if critical_temp_c <= warn_temp_c {
-        return Err(format!(
-            "Environment config invalid: STARLIGHT_CRIT_TEMP_C ({critical_temp_c:.1}) must be higher than STARLIGHT_WARN_TEMP_C ({warn_temp_c:.1})"
-        )
-        .into());
-    }
-
-    if let Some(start_temp) = read_cpu_temperature_c() {
-        println!(
-            "Starting Starlight. Current CPU temperature: {:.1}°C",
-            start_temp
-        );
-    }
-
-    println!(
-        "CPU monitor enabled: warning at {:.1}°C, shutdown at {:.1}°C (interval: {:?})",
-        warn_temp_c, critical_temp_c, temp_check_interval
-    );
-    if let Some(path) = signal_socket_path.as_deref() {
-        println!(
-            "Thermal signal publisher listening on: {} (owner: {}, mode: 0660)",
-            path, signal_socket_owner
-        );
-    }
-
-    let thermal_state_arc = Arc::new(AtomicU8::new(THERMAL_STATE_NORMAL));
-    let monitor_running = running.clone();
-    let monitor_state = thermal_state_arc.clone();
-    let monitor_signal_publisher = signal_publisher_setup
-        .as_ref()
-        .map(|(publisher, _)| publisher.clone());
-    let monitor = thread::spawn(move || {
-        let mut warned = false;
-        let mut last_emitted_state = THERMAL_STATE_NORMAL;
-        let mut last_signal = Instant::now()
-            .checked_sub(temp_check_interval)
-            .unwrap_or_else(Instant::now);
-
-        while monitor_running.load(Ordering::Acquire) {
-            let mut current_temp: Option<f32> = None;
-            if let Some(temperature_c) = read_cpu_temperature_c() {
-                current_temp = Some(temperature_c);
-                if temperature_c >= critical_temp_c {
-                    monitor_state.store(THERMAL_STATE_CRITICAL, Ordering::Release);
-                    eprintln!(
-                        "CRITICAL: CPU temperature {:.1}°C >= {:.1}°C, stopping capture",
-                        temperature_c, critical_temp_c
-                    );
-                    if let Some(publisher) = monitor_signal_publisher.as_ref() {
-                        emit_thermal_signal(
-                            publisher,
-                            THERMAL_STATE_CRITICAL,
-                            current_temp,
-                            warn_temp_c,
-                            critical_temp_c,
-                        );
-                    }
-                    monitor_running.store(false, Ordering::Release);
-                    break;
-                }
-
-                if temperature_c >= warn_temp_c {
-                    monitor_state.store(THERMAL_STATE_WARNING, Ordering::Release);
-                    if !warned {
-                        eprintln!(
-                            "WARNING: CPU temperature {:.1}°C >= {:.1}°C",
-                            temperature_c, warn_temp_c
-                        );
-                        warned = true;
-                    }
-                } else if warned {
-                    monitor_state.store(THERMAL_STATE_NORMAL, Ordering::Release);
-                    println!("CPU temperature recovered to {:.1}°C", temperature_c);
-                    warned = false;
-                }
-            } else {
-                eprintln!("Unable to read CPU temperature from /sys/class/thermal/*/temp");
-            }
-
-            let current_state = monitor_state.load(Ordering::Acquire);
-            let should_emit =
-                current_state != last_emitted_state || last_signal.elapsed() >= temp_check_interval;
-            if should_emit {
-                if let Some(publisher) = monitor_signal_publisher.as_ref() {
-                    emit_thermal_signal(
-                        publisher,
-                        current_state,
-                        current_temp,
-                        warn_temp_c,
-                        critical_temp_c,
-                    );
-                }
-                last_signal = Instant::now();
-                last_emitted_state = current_state;
-            }
-
-            thread::sleep(temp_check_interval);
-        }
-    });
-
-    let mut fb = OpenOptions::new().write(true).open(fbuffer)?;
-
-    let mut buffer = [0u8; 128];
-    for i in 0..8 {
-        buffer[i * 2] = 0;
-        buffer[i * 2 + 1] = 0x0F;
-    }
-
-    fb.write_all(&buffer)?;
-    fb.seek(SeekFrom::Start(0))?;
-    thread::sleep(Duration::from_secs(3));
-
-    let clear = [0, 0].repeat(64);
-    fb.write_all(&clear)?;
-    fb.seek(SeekFrom::Start(0))?;
-
-    let buffer = [255, 0].repeat(64);
-    fb.write_all(&buffer)?;
-    fb.seek(SeekFrom::Start(0))?;
-
-    thread::sleep(Duration::from_secs(3));
-
-    fb.write_all(&[0; 128])?;
-    fb.seek(SeekFrom::Start(0))?;
-
-    let interfaces = datalink::interfaces();
-    let interface = interfaces
-        .into_iter()
-        .find(|iface| iface.name == interface_name)
-        .expect("Interface not found");
-
-    let mut config = Config::default();
-    config.promiscuous = true;
-    config.read_timeout = Some(temp_check_interval);
-
-    let mut channel = match datalink::channel(&interface, config) {
-        Ok(Channel::Ethernet(_tx, rx)) => rx,
-        Ok(_) => panic!("Unhandled channel type"),
-        Err(e) => panic!("Failed to create datalink channel: {}", e),
-    };
-
-    println!("Listening on interface: {}", interface_name);
-
-    let compressor = PacketCompressor::new(PACKET_VECTOR_SIZE, COMPRESSED_PACKET_SIZE);
-    let mut warning_pulse = false;
-    let mut last_warning_pulse_toggle = Instant::now();
-    let warning_pulse_rate = Duration::from_millis(350);
-    let yellow_frame: [u8; 128] = {
-        let mut frame = [0u8; 128];
-        for i in 0..64 {
-            frame[i * 2] = 0xFF;
-            frame[i * 2 + 1] = 0xF0;
-        }
-        frame
-    };
-    let red_frame: [u8; 128] = {
-        let mut frame = [0u8; 128];
-        for i in 0..64 {
-            frame[i * 2] = 0xFF;
-        }
-        frame
-    };
-    let clear_frame = [0u8; 128];
-
-    loop {
-        let current_thermal_state = thermal_state_arc.load(Ordering::Acquire);
-        if !running.load(Ordering::Acquire) {
-            if current_thermal_state == THERMAL_STATE_CRITICAL {
-                if last_warning_pulse_toggle.elapsed() >= warning_pulse_rate {
-                    warning_pulse = !warning_pulse;
-                }
-
-                let frame = if warning_pulse {
-                    &red_frame
-                } else {
-                    &clear_frame
-                };
-                fb.write_all(frame)?;
-                fb.seek(SeekFrom::Start(0))?;
-            }
-            break;
-        }
-
-        let current_thermal_state = thermal_state_arc.load(Ordering::Acquire);
-        let mut frame_data: Option<[u8; FRAMEBUFFER_SIZE_BYTES]> = None;
-
-        match channel.next() {
-            Ok(packet) => {
-                if current_thermal_state == THERMAL_STATE_NORMAL {
-                    frame_data = Some(packet_to_frame_bytes(&compressor, packet));
-                }
-            }
-            Err(e) => {
-                if e.kind() != io::ErrorKind::WouldBlock && e.kind() != io::ErrorKind::TimedOut {
-                    eprintln!("Failed to read packet: {}", e);
-                }
-            }
-        }
-
-        let current_thermal_state = thermal_state_arc.load(Ordering::Acquire);
-        if current_thermal_state != THERMAL_STATE_NORMAL {
-            if last_warning_pulse_toggle.elapsed() >= warning_pulse_rate {
-                warning_pulse = !warning_pulse;
-                last_warning_pulse_toggle = Instant::now();
-            }
-
-            let frame = if warning_pulse {
-                match current_thermal_state {
-                    THERMAL_STATE_WARNING => &yellow_frame,
-                    THERMAL_STATE_CRITICAL => &red_frame,
-                    _ => &clear_frame,
-                }
-            } else {
-                &clear_frame
-            };
-            fb.write_all(frame)?;
-            fb.seek(SeekFrom::Start(0))?;
-            continue;
-        }
-
-        if let Some(frame) = frame_data {
-            fb.write_all(&frame)?;
-            fb.seek(SeekFrom::Start(0))?;
-        }
-    }
-
-    running.store(false, Ordering::Release);
-    if let Err(err) = monitor.join() {
-        eprintln!("Temperature monitor thread failed: {:?}", err);
-    }
-    if let Some((_, accept_thread)) = signal_publisher_setup {
-        if let Err(err) = accept_thread.join() {
-            eprintln!("Thermal signal accept thread failed: {:?}", err);
-        }
-    }
-    if let Some(path) = signal_socket_path.as_deref() {
-        let _ = remove_file(path);
-    }
-
-    Ok(())
+/// starlight drives a Sense HAT framebuffer from `AF_PACKET` capture on a
+/// Raspberry Pi; neither has a meaningful non-Linux equivalent. The pure
+/// packet-compression, thermal-payload, and socket-permission code above
+/// still builds and is still tested everywhere, so the crate stays usable
+/// as a development target on a workstation.
+#[cfg(not(target_os = "linux"))]
+pub fn run() -> Result<(), Box<dyn std::error::Error>> {
+    Err(
+        "starlight's capture and framebuffer runtime requires Linux (Raspberry Pi + Sense HAT)"
+            .into(),
+    )
 }

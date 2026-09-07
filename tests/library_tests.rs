@@ -3,19 +3,28 @@ use std::fs::{self, File};
 use std::io::{self, Read};
 use std::os::unix::fs::FileTypeExt;
 use std::os::unix::net::{UnixListener, UnixStream};
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use ndarray::{s, Array1};
+use starlight::loadngo_proactor::Proactor;
 use starlight::{
-    bytes_to_f32_vector, compressed_payload_to_frame_bytes, ensure_socket_owner,
-    initialize_signal_publisher, lookup_user_ids, packet_to_frame_bytes, parse_temp_env,
-    parse_temp_interval_env, thermal_payload, thermal_recommendation, thermal_state_name,
-    unix_timestamp_seconds, PacketCompressor, COMPRESSED_PACKET_SIZE, FRAMEBUFFER_SIZE_BYTES,
-    PACKET_VECTOR_SIZE, THERMAL_STATE_CRITICAL, THERMAL_STATE_NORMAL, THERMAL_STATE_WARNING,
+    bind_signal_socket, bytes_to_f32_vector, compressed_payload_to_frame_bytes,
+    drain_pending_clients, ensure_socket_owner, lookup_user_ids, packet_to_frame_bytes,
+    parse_temp_env, parse_temp_interval_env, thermal_payload, thermal_recommendation,
+    thermal_state_name, unix_timestamp_seconds, PacketCompressor, COMPRESSED_PACKET_SIZE,
+    FRAMEBUFFER_SIZE_BYTES, PACKET_VECTOR_SIZE, THERMAL_STATE_CRITICAL, THERMAL_STATE_NORMAL,
+    THERMAL_STATE_WARNING,
 };
+
+/// The publisher now sends through `IoPort::send`, so exercising it needs
+/// a real proactor. Each platform gets its own backend, so this test runs
+/// against io_uring on the Pi and kqueue on a development workstation.
+#[cfg(target_os = "linux")]
+type TestPort = starlight::loadngo_proactor::IoUringPort;
+#[cfg(not(target_os = "linux"))]
+type TestPort = starlight::loadngo_proactor::KqueuePort;
 
 fn env_lock() -> &'static Mutex<()> {
     static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
@@ -211,33 +220,75 @@ fn thermal_payload_formats_missing_temperature_as_null() {
 #[test]
 fn signal_publisher_emits_to_connected_clients() {
     let path = unique_path("emit");
-    let running = Arc::new(AtomicBool::new(true));
     let owner = current_username();
-    let (publisher, accept_thread) =
-        initialize_signal_publisher(&path, &owner, Arc::clone(&running)).unwrap();
+    let (listener, publisher) = bind_signal_socket(&path, &owner).unwrap();
 
     let mut client = UnixStream::connect(&path).unwrap();
-    thread::sleep(Duration::from_millis(150));
+    // Fail rather than hang if the send never lands.
+    client
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
 
-    publisher.emit("hello");
+    // Stands in for the proactor's readiness callback.
+    drain_pending_clients(&listener, &publisher);
+    assert_eq!(publisher.client_count(), 1);
+
+    let proactor = Proactor::new(TestPort::new().unwrap());
+    let handle = proactor.handle();
+    let driver = thread::spawn(move || {
+        let _ = proactor.run_until_stopped();
+    });
+
+    publisher.emit_via(&handle, "hello");
 
     let mut buf = [0u8; 6];
     client.read_exact(&mut buf).unwrap();
     assert_eq!(&buf, b"hello\n");
 
-    running.store(false, Ordering::Release);
-    accept_thread.join().unwrap();
+    handle.stop().unwrap();
+    driver.join().unwrap();
     fs::remove_file(&path).unwrap();
 }
 
 #[test]
-fn initialize_signal_publisher_rejects_regular_files() {
+fn signal_publisher_drops_clients_whose_send_fails() {
+    let path = unique_path("emit-drop");
+    let owner = current_username();
+    let (listener, publisher) = bind_signal_socket(&path, &owner).unwrap();
+
+    let client = UnixStream::connect(&path).unwrap();
+    drain_pending_clients(&listener, &publisher);
+    assert_eq!(publisher.client_count(), 1);
+
+    let proactor = Proactor::new(TestPort::new().unwrap());
+    let handle = proactor.handle();
+    let driver = thread::spawn(move || {
+        let _ = proactor.run_until_stopped();
+    });
+
+    // A disconnected peer must be pruned rather than accumulating.
+    drop(client);
+    for _ in 0..50 {
+        publisher.emit_via(&handle, "hello");
+        if publisher.client_count() == 0 {
+            break;
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+    assert_eq!(publisher.client_count(), 0);
+
+    handle.stop().unwrap();
+    driver.join().unwrap();
+    fs::remove_file(&path).unwrap();
+}
+
+#[test]
+fn bind_signal_socket_rejects_regular_files() {
     let path = unique_path("nonsocket");
     File::create(&path).unwrap();
-    let running = Arc::new(AtomicBool::new(true));
     let owner = current_username();
 
-    let err = initialize_signal_publisher(&path, &owner, running)
+    let err = bind_signal_socket(&path, &owner)
         .err()
         .expect("regular file path should be rejected");
     assert_eq!(err.kind(), io::ErrorKind::AlreadyExists);
@@ -246,22 +297,32 @@ fn initialize_signal_publisher_rejects_regular_files() {
 }
 
 #[test]
-fn initialize_signal_publisher_replaces_stale_socket_path() {
+fn bind_signal_socket_replaces_stale_socket_path() {
     let path = unique_path("stale");
     let stale_listener = UnixListener::bind(&path).unwrap();
     drop(stale_listener);
 
     assert!(fs::metadata(&path).unwrap().file_type().is_socket());
 
-    let running = Arc::new(AtomicBool::new(true));
     let owner = current_username();
-    let (_publisher, accept_thread) =
-        initialize_signal_publisher(&path, &owner, Arc::clone(&running)).unwrap();
+    let (_listener, _publisher) = bind_signal_socket(&path, &owner).unwrap();
 
     assert!(fs::metadata(&path).unwrap().file_type().is_socket());
 
-    running.store(false, Ordering::Release);
-    accept_thread.join().unwrap();
+    fs::remove_file(&path).unwrap();
+}
+
+#[test]
+fn drain_pending_clients_returns_when_no_connection_is_waiting() {
+    let path = unique_path("drain-empty");
+    let owner = current_username();
+    let (listener, publisher) = bind_signal_socket(&path, &owner).unwrap();
+
+    // The listener is non-blocking, so this must return on WouldBlock
+    // rather than parking the proactor thread.
+    drain_pending_clients(&listener, &publisher);
+    assert_eq!(publisher.client_count(), 0);
+
     fs::remove_file(&path).unwrap();
 }
 

@@ -4,8 +4,18 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-rppal = "0.19"
-pnet = "0.35"
+# All asynchronous I/O -- packet capture, framebuffer writes, the thermal
+# timer, and thermal-socket sends -- runs through this crate's io_uring
+# backend on Linux. See src/runtime.rs and docs/RESILIENCE_PLAN.md.
+loadngo-proactor = { git = "https://github.com/jaylauffer/loadngo.git", branch = "dev" }
 ndarray = "0.16"
 libc = "0.2"
+
+# Removed alongside the proactor migration, both unused in practice:
+#   rppal  -- never referenced by any source file; it is a Pi GPIO/UART
+#             crate that also fails to compile on a non-Linux workstation,
+#             so it broke `cargo build` off-target for no benefit.
+#   pnet   -- only ever used for `datalink::channel()`, whose boxed
+#             receiver hides the fd that io_uring needs. See
+#             src/runtime.rs for the AF_PACKET socket that replaced it.
 #cpal = "0.15"
