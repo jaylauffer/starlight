@@ -72,6 +72,32 @@ thresholds documented in [README.md](../README.md). The longer-term target is
 to move toward these operating bands so the process degrades instead of
 falling off a cliff.
 
+## Workspace Role
+
+The thermal bands above are not only about protecting the board. They are
+also an input to what the rest of the lab should ask of it.
+
+`starlight` runs on `agnes`, which sits on the same workspace network as the
+`loadngo` task fabric — submitter-driven discovery (one multicast
+`TaskRequest`, direct unicast `TaskOffer` replies, an explicit `TaskAccept`,
+then `TaskStatus`/`TaskResult`/`TaskAck`, with qcoin reward only after
+acknowledged completion). `loadngo/docs/TASK_EXECUTION_TEST_PLAN.md` names
+`agnes` as an example worker.
+
+So the device can serve as a constrained, radio-adjacent observer on that
+network, and **its thermal state should be treated as an operational input
+when deciding whether it should do more than minimal observation or
+signaling.** A board already in the warm band is a poor candidate to accept
+a task offer; one in the critical band should not be offered work at all.
+That is the reason the thermal socket publishes a `recommendation`
+(`normal` / `throttle` / `pause`) rather than only a raw temperature — the
+recommendation is meant to be actionable by something other than
+`starlight` itself.
+
+This rationale was previously recorded only in an untracked `.codex` note
+that never reached a durable branch; the rest of that note has been
+superseded by this document and `README.md`.
+
 ## Supervisor Model
 
 `starlight` should be treated as a supervised service, not a manually launched
