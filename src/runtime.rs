@@ -49,7 +49,15 @@ use crate::{
 
 /// Readiness token for the thermal signal listener. starlight registers
 /// exactly one readable source, so a single constant is enough.
-const LISTENER_TOKEN: u64 = 1;
+///
+/// The value matters. `IoUringPort` puts readiness tokens in the same
+/// `user_data` space as its own reserved `QUEUE_TOKEN` (1) and
+/// `WAKE_TOKEN` (2), and dispatches on that value in `poll()`. A token of
+/// 1 or 2 is accepted by `register_readable` without complaint and then
+/// silently misrouted -- the callback simply never fires, which is
+/// exactly what a first cut at this used. `"STARLI"` in ASCII, following
+/// the same convention as `camera_preview`'s `CAMERA_STREAM_TOKEN`.
+const LISTENER_TOKEN: u64 = 0x5354_4152_4c49;
 
 /// Sized to the largest frame `bytes_to_f32_vector` will look at; it
 /// truncates anything longer anyway.
