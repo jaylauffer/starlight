@@ -106,15 +106,22 @@ pub fn bytes_to_f32_vector(bytes: &[u8]) -> Array1<f32> {
 }
 
 pub fn compressed_payload_to_frame_bytes(compressed: &Array1<f32>) -> [u8; FRAMEBUFFER_SIZE_BYTES] {
+    const LANE: usize = std::mem::size_of::<f32>();
+
     let mut frame = [0u8; FRAMEBUFFER_SIZE_BYTES];
-    for (chunk, value) in frame.chunks_exact_mut(std::mem::size_of::<f32>()).zip(
+    // `as_chunks_mut` rather than `chunks_exact_mut`: the chunk size is a
+    // constant, so this yields `&mut [u8; 4]` instead of a runtime-length
+    // slice, and satisfies clippy's `chunks_exact_to_as_chunks` (a 1.98
+    // lint -- agnes is a release ahead of this workstation).
+    let (slots, _remainder) = frame.as_chunks_mut::<LANE>();
+    for (slot, value) in slots.iter_mut().zip(
         compressed
             .iter()
             .copied()
             .chain(std::iter::repeat(0.0))
             .take(COMPRESSED_PACKET_SIZE),
     ) {
-        chunk.copy_from_slice(&value.to_le_bytes());
+        slot.copy_from_slice(&value.to_le_bytes());
     }
     frame
 }
