@@ -40,7 +40,7 @@ checksum = "6800badb6cb2082ffd7b6a67e6125bb39f18782f793520caee8cb8846be06112"
 [[package]]
 name = "loadngo-proactor"
 version = "0.1.0"
-source = "git+https://github.com/jaylauffer/loadngo.git?branch=dev#020a8420c94915148aab2f7ff27d41971eff3d7a"
+source = "git+https://github.com/jaylauffer/loadngo.git?branch=dev#3f37d14aa10b027c19b569cd32b8b7c7244df9ff"
 dependencies = [
  "io-uring",
  "libc",

@@ -308,11 +308,12 @@ pub fn emit_thermal_signal<P: IoPort>(
 ///
 /// This used to also spawn a dedicated accept thread that polled a
 /// non-blocking `accept()` on a 100ms `thread::sleep` loop. That thread
-/// is gone: the listener is now registered with the proactor and drained
-/// only when the kernel reports it readable (see
-/// [`runtime::serve`]). The listener is still returned in non-blocking
-/// mode, which is what makes the readiness-driven drain loop terminate
-/// on `WouldBlock` instead of stalling the proactor thread.
+/// is gone: connections now arrive as `IoPort::accept` completions on the
+/// proactor (see [`runtime::serve`]), like every other I/O source here.
+///
+/// Non-blocking is still set on the listener. `IoUringPort::accept` does
+/// not require it, but it costs nothing and keeps the fd safe for any
+/// synchronous fallback.
 pub fn bind_signal_socket(
     path: &str,
     owner: &str,
@@ -335,33 +336,6 @@ pub fn bind_signal_socket(
     ensure_socket_mode(path, 0o660)?;
 
     Ok((listener, ThermalSignalPublisher::new()))
-}
-
-/// Drains every connection currently pending on the listener into the
-/// publisher, stopping at `WouldBlock`.
-///
-/// Deliberately not `IoPort::accept`: that call reports the peer as a
-/// `std::net::SocketAddr`, which it obtains through
-/// `socket2::SockAddr::as_socket()`. For an `AF_UNIX` peer that returns
-/// `None`, so the completion arrives as
-/// `Err(InvalidData, "accept completed but the peer address family was
-/// unrecognized")` -- and the already-accepted fd carried by that
-/// completion is dropped without being closed, leaking one fd per
-/// connection. `IoPort::accept` is IP-only today; a Unix listener has to
-/// go through readiness plus a plain `accept()` until it grows an
-/// address-family-agnostic completion type.
-pub fn drain_pending_clients(listener: &UnixListener, publisher: &ThermalSignalPublisher) {
-    loop {
-        match listener.accept() {
-            Ok((stream, _)) => publisher.add_client(stream),
-            Err(err) if err.kind() == io::ErrorKind::WouldBlock => return,
-            Err(err) if err.kind() == io::ErrorKind::Interrupted => continue,
-            Err(err) => {
-                eprintln!("Thermal signal socket accept error: {}", err);
-                return;
-            }
-        }
-    }
 }
 
 pub fn lookup_user_ids(username: &str) -> io::Result<(u32, u32)> {

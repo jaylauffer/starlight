@@ -11,11 +11,10 @@ use ndarray::{s, Array1};
 use starlight::loadngo_proactor::Proactor;
 use starlight::{
     bind_signal_socket, bytes_to_f32_vector, compressed_payload_to_frame_bytes,
-    drain_pending_clients, ensure_socket_owner, lookup_user_ids, packet_to_frame_bytes,
-    parse_temp_env, parse_temp_interval_env, thermal_payload, thermal_recommendation,
-    thermal_state_name, unix_timestamp_seconds, PacketCompressor, COMPRESSED_PACKET_SIZE,
-    FRAMEBUFFER_SIZE_BYTES, PACKET_VECTOR_SIZE, THERMAL_STATE_CRITICAL, THERMAL_STATE_NORMAL,
-    THERMAL_STATE_WARNING,
+    ensure_socket_owner, lookup_user_ids, packet_to_frame_bytes, parse_temp_env,
+    parse_temp_interval_env, thermal_payload, thermal_recommendation, thermal_state_name,
+    unix_timestamp_seconds, PacketCompressor, COMPRESSED_PACKET_SIZE, FRAMEBUFFER_SIZE_BYTES,
+    PACKET_VECTOR_SIZE, THERMAL_STATE_CRITICAL, THERMAL_STATE_NORMAL, THERMAL_STATE_WARNING,
 };
 
 /// The publisher now sends through `IoPort::send`, so exercising it needs
@@ -51,6 +50,28 @@ fn current_username() -> String {
     );
     let name = unsafe { std::ffi::CStr::from_ptr((*passwd_ptr).pw_name) };
     name.to_str().unwrap().to_string()
+}
+
+/// Accepts one pending connection into the publisher.
+///
+/// The runtime does this from an `IoPort::accept` completion; these tests
+/// only care about what the publisher does with a client once it has one,
+/// so they take the short path. The listener is non-blocking, so retry
+/// briefly rather than assuming the connection is already queued.
+fn accept_one(listener: &UnixListener, publisher: &starlight::ThermalSignalPublisher) {
+    for _ in 0..100 {
+        match listener.accept() {
+            Ok((stream, _)) => {
+                publisher.add_client(stream);
+                return;
+            }
+            Err(err) if err.kind() == io::ErrorKind::WouldBlock => {
+                thread::sleep(Duration::from_millis(10));
+            }
+            Err(err) => panic!("accept failed: {err}"),
+        }
+    }
+    panic!("no connection arrived");
 }
 
 #[test]
@@ -229,8 +250,7 @@ fn signal_publisher_emits_to_connected_clients() {
         .set_read_timeout(Some(Duration::from_secs(5)))
         .unwrap();
 
-    // Stands in for the proactor's readiness callback.
-    drain_pending_clients(&listener, &publisher);
+    accept_one(&listener, &publisher);
     assert_eq!(publisher.client_count(), 1);
 
     let proactor = Proactor::new(TestPort::new().unwrap());
@@ -257,7 +277,7 @@ fn signal_publisher_drops_clients_whose_send_fails() {
     let (listener, publisher) = bind_signal_socket(&path, &owner).unwrap();
 
     let client = UnixStream::connect(&path).unwrap();
-    drain_pending_clients(&listener, &publisher);
+    accept_one(&listener, &publisher);
     assert_eq!(publisher.client_count(), 1);
 
     let proactor = Proactor::new(TestPort::new().unwrap());
@@ -308,20 +328,6 @@ fn bind_signal_socket_replaces_stale_socket_path() {
     let (_listener, _publisher) = bind_signal_socket(&path, &owner).unwrap();
 
     assert!(fs::metadata(&path).unwrap().file_type().is_socket());
-
-    fs::remove_file(&path).unwrap();
-}
-
-#[test]
-fn drain_pending_clients_returns_when_no_connection_is_waiting() {
-    let path = unique_path("drain-empty");
-    let owner = current_username();
-    let (listener, publisher) = bind_signal_socket(&path, &owner).unwrap();
-
-    // The listener is non-blocking, so this must return on WouldBlock
-    // rather than parking the proactor thread.
-    drain_pending_clients(&listener, &publisher);
-    assert_eq!(publisher.client_count(), 0);
 
     fs::remove_file(&path).unwrap();
 }

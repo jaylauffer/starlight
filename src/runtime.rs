@@ -7,7 +7,7 @@
 //!
 //! | before | now |
 //! | --- | --- |
-//! | accept thread polling a non-blocking `accept()` behind `thread::sleep(100ms)` | proactor readiness on the listener, drained only when the kernel says readable |
+//! | accept thread polling a non-blocking `accept()` behind `thread::sleep(100ms)` | `IoPort::accept`, re-armed from its own completion |
 //! | thermal thread looping on `thread::sleep(interval)` | `ProactorHandle::defer_for`, re-armed from its own completion |
 //! | blocking `pnet` `channel.next()` on the main thread | `IoPort::recv` on an `AF_PACKET` socket, re-armed from its own completion |
 //! | blocking `write_all` + `seek(0)` per frame | `IoPort::write` at an explicit offset |
@@ -31,33 +31,25 @@ use std::fs::{File, OpenOptions};
 use std::io::{self, Seek, SeekFrom, Write};
 use std::mem;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
-use std::os::unix::net::UnixListener;
+use std::os::unix::net::{UnixListener, UnixStream};
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
 use loadngo_proactor::{
-    CompletionKind, IoBuf, IoResult, IoUringPort, Proactor, ProactorHandle, ReadinessEvent,
+    AcceptResult, CompletionKind, IoBuf, IoResult, IoUringPort, Proactor, ProactorHandle,
 };
 
 use crate::{
-    bind_signal_socket, drain_pending_clients, emit_thermal_signal, lookup_user_ids,
-    packet_to_frame_bytes, read_cpu_temperature_c, Config, PacketCompressor,
-    ThermalSignalPublisher, COMPRESSED_PACKET_SIZE, FRAMEBUFFER_SIZE_BYTES, PACKET_VECTOR_SIZE,
-    THERMAL_STATE_CRITICAL, THERMAL_STATE_NORMAL, THERMAL_STATE_WARNING,
+    bind_signal_socket, emit_thermal_signal, lookup_user_ids, packet_to_frame_bytes,
+    read_cpu_temperature_c, Config, PacketCompressor, ThermalSignalPublisher,
+    COMPRESSED_PACKET_SIZE, FRAMEBUFFER_SIZE_BYTES, PACKET_VECTOR_SIZE, THERMAL_STATE_CRITICAL,
+    THERMAL_STATE_NORMAL, THERMAL_STATE_WARNING,
 };
 
-/// Readiness token for the thermal signal listener. starlight registers
-/// exactly one readable source, so a single constant is enough.
-///
-/// The value matters. `IoUringPort` puts readiness tokens in the same
-/// `user_data` space as its own reserved `QUEUE_TOKEN` (1) and
-/// `WAKE_TOKEN` (2), and dispatches on that value in `poll()`. A token of
-/// 1 or 2 is accepted by `register_readable` without complaint and then
-/// silently misrouted -- the callback simply never fires, which is
-/// exactly what a first cut at this used. `"STARLI"` in ASCII, following
-/// the same convention as `camera_preview`'s `CAMERA_STREAM_TOKEN`.
-const LISTENER_TOKEN: u64 = 0x5354_4152_4c49;
+/// How long to wait before retrying a failed accept, so a persistently
+/// broken listener cannot spin the proactor thread.
+const ACCEPT_RETRY_DELAY: Duration = Duration::from_secs(1);
 
 /// Sized to the largest frame `bytes_to_f32_vector` will look at; it
 /// truncates anything longer anyway.
@@ -149,7 +141,7 @@ pub fn serve(config: Config) -> Result<(), Box<dyn std::error::Error>> {
         capture,
         framebuffer,
         // Held for the proactor's lifetime so the listener fd stays open
-        // for as long as its readiness registration refers to it.
+        // for as long as an accept is outstanding against it.
         listener: listener.clone(),
         publisher,
         compressor: PacketCompressor::new(PACKET_VECTOR_SIZE, COMPRESSED_PACKET_SIZE),
@@ -163,22 +155,7 @@ pub fn serve(config: Config) -> Result<(), Box<dyn std::error::Error>> {
         temp_check_interval,
     });
 
-    if let Some(listener) = listener {
-        let accept_state = Arc::clone(&state);
-        handle.register_readable(
-            listener.as_raw_fd(),
-            LISTENER_TOKEN,
-            move |_: ReadinessEvent| {
-                if let (Some(listener), Some(publisher)) = (
-                    accept_state.listener.as_ref(),
-                    accept_state.publisher.as_ref(),
-                ) {
-                    drain_pending_clients(listener, publisher);
-                }
-            },
-        )?;
-    }
-
+    state.arm_accept();
     state.arm_thermal_tick();
     state.arm_capture();
 
@@ -211,6 +188,70 @@ struct RuntimeState {
 }
 
 impl RuntimeState {
+    /// Submits one `accept` on the thermal signal listener, re-arming
+    /// from its own completion the same way capture does.
+    ///
+    /// This was readiness plus a plain `accept()` until `IoPort::accept`
+    /// learned to report non-IP peers: it used to resolve the peer as a
+    /// `std::net::SocketAddr` and, for an `AF_UNIX` connection, return an
+    /// error while dropping the accepted descriptor unclosed. With
+    /// `PeerAddr` in place the socket runs on true proactor semantics
+    /// like everything else in this process.
+    fn arm_accept(self: &Arc<Self>) {
+        let Some(listener) = self.listener.as_ref() else {
+            return;
+        };
+
+        let state = Arc::clone(self);
+        let submitted = self
+            .handle
+            .accept(listener.as_raw_fd(), move |result: AcceptResult| {
+                state.on_accept(result);
+            });
+
+        if let Err(err) = submitted {
+            eprintln!("Unable to submit thermal socket accept: {}", err);
+        }
+    }
+
+    fn on_accept(self: &Arc<Self>, result: AcceptResult) {
+        match result {
+            Ok(transfer) => {
+                match self.publisher.as_ref() {
+                    // SAFETY: the descriptor came from a completed accept
+                    // and is owned by this handler; wrapping it transfers
+                    // that ownership to the publisher, which closes it
+                    // when the client is dropped.
+                    Some(publisher) => {
+                        publisher.add_client(unsafe { UnixStream::from_raw_fd(transfer.new_fd) })
+                    }
+                    None => drop(unsafe { UnixStream::from_raw_fd(transfer.new_fd) }),
+                }
+                self.arm_accept();
+            }
+            Err(err) => {
+                // Re-arm on a delay rather than immediately. A listener
+                // that fails every accept -- a closed or broken fd --
+                // would otherwise spin this thread at full speed, which
+                // is exactly the tight retry loop docs/RESILIENCE_PLAN.md
+                // warns against under load.
+                eprintln!("Thermal signal socket accept error: {}", err);
+                let state = Arc::clone(self);
+                let scheduled = self.handle.defer_for(
+                    ACCEPT_RETRY_DELAY,
+                    CompletionKind::Timer,
+                    0,
+                    move |_| {
+                        state.arm_accept();
+                    },
+                );
+                if let Err(err) = scheduled {
+                    eprintln!("Unable to reschedule thermal socket accept: {}", err);
+                }
+            }
+        }
+    }
+
     /// Submits one `recv` on the capture socket. The completion handler
     /// calls this again, so capture is a self-sustaining chain of kernel
     /// operations rather than a loop that blocks a thread.
