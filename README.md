@@ -91,7 +91,7 @@ background monitor for `/sys/class/thermal/thermal_zone*/temp`.
 
 Defaults:
 
-- Warn at `80.0`°C (`STARLIGHT_WARN_TEMP_C`)
+- Warn at `82.0`°C (`STARLIGHT_WARN_TEMP_C`)
 - Stop at `85.0`°C (`STARLIGHT_CRIT_TEMP_C`)
 - Check interval `5` seconds (`STARLIGHT_TEMP_CHECK_INTERVAL_SECS`)
 - Optional Unix domain signal socket (`STARLIGHT_SIGNAL_SOCKET`)

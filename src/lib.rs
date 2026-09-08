@@ -465,7 +465,12 @@ impl Config {
             .next()
             .ok_or("Usage: starlight <interface_name> <framebuffer_name>")?;
 
-        let warn_temp_c = parse_temp_env("STARLIGHT_WARN_TEMP_C", 80.0);
+        // 82 rather than 80: a Pi 4 saturating four cores on a cargo build
+        // sits in the low 80s as a matter of course, so warning at 80 fired on
+        // ordinary work rather than on trouble. Critical stays at 85 — that is
+        // near the BCM2711's rated maximum, so there is no headroom to spend
+        // above it, and the gap to the warning is deliberately kept.
+        let warn_temp_c = parse_temp_env("STARLIGHT_WARN_TEMP_C", 82.0);
         let critical_temp_c = parse_temp_env("STARLIGHT_CRIT_TEMP_C", 85.0);
         let temp_check_interval = std::time::Duration::from_secs(parse_temp_interval_env(
             "STARLIGHT_TEMP_CHECK_INTERVAL_SECS",
