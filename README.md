@@ -12,8 +12,9 @@ Pi hardware rather than as a generic packet-capture daemon.
 Every I/O source runs on one `Proactor<IoUringPort>` from
 [`loadngo-proactor`](https://github.com/jaylauffer/loadngo): packet capture is
 an `IoPort::recv` on an `AF_PACKET` socket, framebuffer updates are
-`IoPort::write`, the thermal interval is a proactor deferred timer, and thermal
-subscribers are fed with `IoPort::send`. The process runs a single thread.
+`IoPort::write`, the thermal interval is a proactor deferred timer, thermal
+subscribers arrive via `IoPort::accept` and are fed with `IoPort::send`. The
+process runs a single thread.
 See [src/runtime.rs](src/runtime.rs) for the mapping and
 [docs/RESILIENCE_PLAN.md](docs/RESILIENCE_PLAN.md) for the operational target.
 
