@@ -25,6 +25,22 @@ Environment=STARLIGHT_SIGNAL_SOCKET_OWNER=jay
 ExecStart=/bin/sh -c 'exec /home/jay/pudding/starlight/target/release/starlight eth0 "$(/home/jay/pudding/starlight/scripts/sense-hat-fb.sh)"'
 Restart=on-failure
 RestartSec=2
+# starlight shares this board with GitHub Actions runners, so it must not
+# be able to starve a build. Measured on agnes: unbounded, it saturated a
+# full core at ~70 packets/sec of ordinary link traffic and made a clean
+# rebuild 29% slower (10.1s -> 13.0s).
+#
+# Nice alone was measured as insufficient (12.2s) -- it is a scheduling
+# weight, and with a build's own -j4 threads also runnable it still gets a
+# large share. CPUQuota is a hard cgroup ceiling and is what actually
+# bounds the damage; Nice makes it yield promptly within that ceiling.
+#
+# The in-process frame gate (STARLIGHT_MIN_FRAME_INTERVAL_MS) is the real
+# fix and normally keeps usage far below this. The quota is the backstop
+# for when it is misconfigured or disabled.
+CPUQuota=25%
+Nice=19
+IOSchedulingClass=idle
 # A framebuffer retains its last frame after the writer exits, so a
 # stopped or crashed starlight otherwise leaves a stale pattern lit on the
 # HAT that is indistinguishable from a hung process. ExecStopPost runs on

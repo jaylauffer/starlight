@@ -39,11 +39,37 @@ pub struct PacketCompressor {
     biases4: Array1<f32>,
 }
 
+/// Hidden layer widths.
+///
+/// These were `1024 / 512 / 256`, which made the weight set 8.9 MB — read
+/// in full for every packet, against a 1 MB L2. Measured on agnes (Pi 4),
+/// that cost **76.9 ms per packet**: a ceiling of 13 packets/sec, one core
+/// fully saturated by roughly 70 packets/sec of ordinary link traffic, and
+/// an effective 58 MFLOPS, about 2% of what the core can do. The shape was
+/// the problem, not the hardware — a vector-by-matrix product streaming
+/// 8.9 MB has no data reuse to exploit, so it was bounded by memory rather
+/// than arithmetic.
+///
+/// These widths keep the same four-layer ReLU structure — this is meant to
+/// be the front of a network, and that character is the point — while
+/// bringing the weights to ~0.63 MB, which stays resident in L2. That is a
+/// step change rather than a linear saving: the layers get ~14x cheaper in
+/// multiply-accumulates, and stop going to DRAM on every packet.
+///
+/// Nothing downstream depends on the specific values. The projection is
+/// deterministic but untrained — `generate_waveform_weights` is
+/// `0.11389 + sin(..)cos(..)`, `generate_parabolic_weights` is
+/// `(x-0.5)^2 + (y-0.5)^2` — so widening these again is purely a
+/// cost/latency decision, not an accuracy one.
+pub const LAYER1_SIZE: usize = 96;
+pub const LAYER2_SIZE: usize = 64;
+pub const LAYER3_SIZE: usize = 48;
+
 impl PacketCompressor {
     pub fn new(input_size: usize, compressed_size: usize) -> Self {
-        let layer1_size = 1024;
-        let layer2_size = 512;
-        let layer3_size = 256;
+        let layer1_size = LAYER1_SIZE;
+        let layer2_size = LAYER2_SIZE;
+        let layer3_size = LAYER3_SIZE;
 
         PacketCompressor {
             weights1: Self::generate_waveform_weights(input_size, layer1_size),
@@ -415,6 +441,16 @@ pub struct Config {
     pub warn_temp_c: f32,
     pub critical_temp_c: f32,
     pub temp_check_interval: std::time::Duration,
+    /// Shortest gap between two rendered frames.
+    ///
+    /// Capture is promiscuous, so on a busy segment the old code ran a
+    /// full projection for every packet the link carried — unbounded work
+    /// driven entirely by other people's traffic. An 8x8 matrix cannot
+    /// show more than a handful of distinct frames per second anyway, so
+    /// packets arriving inside this window are dropped without being
+    /// compressed. That turns CPU cost into a number this process chooses
+    /// rather than one the network imposes.
+    pub min_frame_interval: std::time::Duration,
     pub signal_socket_path: Option<String>,
     pub signal_socket_owner: String,
 }
@@ -435,6 +471,14 @@ impl Config {
             "STARLIGHT_TEMP_CHECK_INTERVAL_SECS",
             5,
         ));
+
+        // 0 disables the gate and restores compress-every-packet.
+        let min_frame_interval = std::time::Duration::from_millis(
+            env::var("STARLIGHT_MIN_FRAME_INTERVAL_MS")
+                .ok()
+                .and_then(|value| value.trim().parse::<u64>().ok())
+                .unwrap_or(100),
+        );
 
         if critical_temp_c <= warn_temp_c {
             return Err(format!(
@@ -460,6 +504,7 @@ impl Config {
             warn_temp_c,
             critical_temp_c,
             temp_check_interval,
+            min_frame_interval,
             signal_socket_path,
             signal_socket_owner,
         })

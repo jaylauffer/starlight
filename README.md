@@ -95,6 +95,7 @@ Defaults:
 - Stop at `85.0`°C (`STARLIGHT_CRIT_TEMP_C`)
 - Check interval `5` seconds (`STARLIGHT_TEMP_CHECK_INTERVAL_SECS`)
 - Optional Unix domain signal socket (`STARLIGHT_SIGNAL_SOCKET`)
+- Shortest gap between rendered frames, in ms (`STARLIGHT_MIN_FRAME_INTERVAL_MS`, default `100`; `0` disables)
 - Signal socket owner user (`STARLIGHT_SIGNAL_SOCKET_OWNER`, default: current effective user)
 
 When warning or critical thresholds are reached, `starlight` overrides the
@@ -146,6 +147,32 @@ Useful on-console checks:
 cat /sys/class/thermal/thermal_zone0/temp
 vcgencmd measure_temp
 ```
+
+## Cost, and sharing a board
+
+Capture is promiscuous, so without a limit the projection runs for every
+packet the link carries — work set by other hosts' traffic rather than by
+anything starlight needs. That matters when the board also runs CI.
+
+Measured on a Pi 4 (`agnes`):
+
+| | per packet | one core saturated at | clean rebuild alongside |
+|---|---|---|---|
+| before | 76.9 ms | ~70 pkt/s | 13.0 s (vs 10.1 s idle) |
+| after | 0.92 ms | ~1100 pkt/s | 10.1 s — no measurable impact |
+
+Two changes got there. The hidden layers were narrowed so the weights
+(~0.63 MB) stay resident in L2 instead of streaming 8.9 MB per packet —
+worth 84x, far more than the 14x the arithmetic alone predicts, because
+the old shape was bounded by memory rather than compute.
+`STARLIGHT_MIN_FRAME_INTERVAL_MS` then caps how often a packet is allowed
+to become a frame; an 8x8 matrix shows nothing useful above a few frames
+per second, and at the 100 ms default starlight used 3% of one core under
+load rather than 100%.
+
+`packaging/starlight.service` additionally sets `CPUQuota=25%` as a
+backstop. Note `Nice=` alone was measured as insufficient — it is a
+scheduling weight, so a build's own parallel jobs still crowd it out.
 
 ## Notes
 

@@ -33,8 +33,8 @@ use std::mem;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
-use std::sync::Arc;
-use std::time::Duration;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use loadngo_proactor::{
     AcceptResult, CompletionKind, IoBuf, IoResult, IoUringPort, Proactor, ProactorHandle,
@@ -75,6 +75,7 @@ pub fn serve(config: Config) -> Result<(), Box<dyn std::error::Error>> {
         warn_temp_c,
         critical_temp_c,
         temp_check_interval,
+        min_frame_interval,
         signal_socket_path,
         signal_socket_owner,
     } = config;
@@ -153,6 +154,8 @@ pub fn serve(config: Config) -> Result<(), Box<dyn std::error::Error>> {
         warn_temp_c,
         critical_temp_c,
         temp_check_interval,
+        min_frame_interval,
+        last_frame_at: Mutex::new(None),
     });
 
     state.arm_accept();
@@ -185,6 +188,10 @@ struct RuntimeState {
     warn_temp_c: f32,
     critical_temp_c: f32,
     temp_check_interval: Duration,
+    /// Shortest gap between rendered frames; see [`crate::Config`].
+    min_frame_interval: Duration,
+    /// When the last frame was actually rendered. `None` until the first.
+    last_frame_at: Mutex<Option<Instant>>,
 }
 
 impl RuntimeState {
@@ -289,7 +296,9 @@ impl RuntimeState {
                 // Reuse the capture allocation rather than handing back a
                 // fresh 1518-byte buffer on every single packet.
                 let mut raw = transfer.buf.into_vec();
-                if self.thermal_state.load(Ordering::Acquire) == THERMAL_STATE_NORMAL {
+                if self.thermal_state.load(Ordering::Acquire) == THERMAL_STATE_NORMAL
+                    && self.claim_frame_slot()
+                {
                     let frame = packet_to_frame_bytes(&self.compressor, &raw);
                     self.write_frame(frame.to_vec());
                 }
@@ -311,6 +320,33 @@ impl RuntimeState {
         };
 
         self.arm_capture_with(buf);
+    }
+
+    /// Whether this packet is allowed to become a frame.
+    ///
+    /// Capture is promiscuous, so without this the projection ran for
+    /// every packet on the segment — work set by other people's traffic
+    /// rather than by anything starlight needs. An 8x8 matrix shows
+    /// nothing useful above a few frames per second, so packets arriving
+    /// inside `min_frame_interval` are dropped before the expensive part.
+    ///
+    /// Returns true (and claims the slot) only when enough time has
+    /// passed. A zero interval disables the gate entirely.
+    fn claim_frame_slot(self: &Arc<Self>) -> bool {
+        if self.min_frame_interval.is_zero() {
+            return true;
+        }
+        let Ok(mut last) = self.last_frame_at.lock() else {
+            return true;
+        };
+        let now = Instant::now();
+        match *last {
+            Some(previous) if now.duration_since(previous) < self.min_frame_interval => false,
+            _ => {
+                *last = Some(now);
+                true
+            }
+        }
     }
 
     /// Queues one framebuffer write. The buffer is handed to the kernel
